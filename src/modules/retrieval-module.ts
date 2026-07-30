@@ -124,6 +124,7 @@ export class RetrievalModule implements Module {
       if (concepts.length === 0) {
         this.lastContextHash = contextHash;
         this.cachedInjections = [];
+        console.error(`[retrieval] ${new Date().toISOString()} no injection (no concepts)`);
         return [];
       }
 
@@ -132,6 +133,7 @@ export class RetrievalModule implements Module {
       if (candidates.length === 0) {
         this.lastContextHash = contextHash;
         this.cachedInjections = [];
+        console.error(`[retrieval] ${new Date().toISOString()} no injection (no candidates)`);
         return [];
       }
 
@@ -145,6 +147,7 @@ export class RetrievalModule implements Module {
       if (injected.length === 0) {
         this.lastContextHash = contextHash;
         this.cachedInjections = [];
+        console.error(`[retrieval] ${new Date().toISOString()} no injection (none validated)`);
         return [];
       }
 
@@ -154,12 +157,13 @@ export class RetrievalModule implements Module {
 
       const injections: ContextInjection[] = [{
         namespace: 'retrieval',
-        position: 'system',
-        content: [{ type: 'text', text: `## Retrieved Knowledge\n${text}` }],
+        position: 'afterUser',
+        content: [{ type: 'text', text: `## Retrieved Knowledge — your own lessons, in your own words, machine-surfaced from your notes\n${text}` }],
       }];
 
       this.lastContextHash = contextHash;
       this.cachedInjections = injections;
+      console.error(`[retrieval] ${new Date().toISOString()} injected ${injected.length} lessons`);
       return injections;
     } catch (err) {
       // Fail open — don't block inference if retrieval fails
