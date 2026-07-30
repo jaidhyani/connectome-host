@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **RetrievalModule injects at `afterUser` instead of `system`, with a
+  self-attributing heading.** The per-turn lesson selection was appended to
+  the system prompt, so any selection change (or the block flipping
+  absent/present) rewrote the earliest bytes of the request and invalidated
+  the entire cached prefix under exact-prefix prompt caching — measured at
+  ~25x the warm-call cache-write volume (4,375 vs 176 tokens/call) and 70/135
+  full re-primes vs 0. The injection now rides the uncached tail (membrane
+  merges it into the newest user envelope; it is not a separate turn) and the
+  heading names the lessons as the agent's own, machine-surfaced — without
+  attribution, message-position notes were occasionally explicitly
+  distrusted. Retrieval decisions now log one timestamped stderr line
+  (injected / no-injection) for live fire-rate observability.
+
 - **Subscription-GC closes carry honest provenance and respect explicit
   opens** (Discord issue #5, the Mythos "channel settings keep resetting"
   mechanism). GC closes are now recorded as `subscription-gc`, never
