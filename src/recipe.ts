@@ -73,8 +73,20 @@ export interface RecipeStrategy {
   compressionSlackRatio?: number;
   /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
    *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
-   *  only to opt into the legacy planners. */
-  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+   *  only to opt into the legacy planners, or to 'lsm-compaction' for the
+   *  layered-cascade planner (boundary-local changes; most turns pure append). */
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'lsm-compaction';
+  /** lsm-compaction: layer budget split [L1, L2, bottom] as fractions of the
+   *  middle budget. Default [0.45, 0.35, 0.20]. */
+  lsmLayerBudgetRatios?: [number, number, number];
+  /** lsm-compaction: deepest fold level to target. Default 4. */
+  lsmMaxFoldLevel?: number;
+  /** lsm-compaction: tokens a layer may sit over threshold before cascading
+   *  (hysteresis against thrash). Default 2000. */
+  lsmCascadeHysteresis?: number;
+  /** lsm-compaction: cut size (tokens) for L1->L2 promotion; also the scale the
+   *  step-1 intake cap is matched to. Default 8000. */
+  lsmPromotionSize?: number;
   speculativeProduction?: boolean;
   /** L1 production holdback: keep the newest N closed chunks out of the
    *  speculative compression queue (default 1); demand still overrides. */
@@ -100,6 +112,10 @@ export interface RecipeStrategy {
    *  names the agent and directs attribution so pure-witness chunks don't
    *  flip the summarizer into another speaker's identity. */
   identityReminder?: string;
+  /** Compression call mode: 'inline' appends compression instructions to
+   *  the last compiled main-conversation context (reusing its cache prefix),
+   *  'separate' (default) builds an independent context per the original design. */
+  compressionMode?: 'inline' | 'separate';
 }
 
 export interface RecipeAgent {
@@ -133,6 +149,28 @@ export interface RecipeAgent {
    *  Not forwarded on bedrock — that transport only has the default 5m
    *  cache and rejects the ttl field. */
   cacheTtl?: '5m' | '1h';
+  /**
+   * Prompt-cache keepalive. With `cacheTtl: '1h'`, an idle agent's cached
+   * prefix expires after an hour and its next wake pays a 2x cache write over
+   * the whole context. Reading an entry refreshes its TTL at 0.1x, so a
+   * periodic `max_tokens: 0` replay holds it warm for pennies.
+   *
+   * On by default for the anthropic provider (ignored elsewhere — bedrock has
+   * no 1h cache). Measured on fable-cm 2026-08-11..22: 49.7M tokens of cache
+   * writes followed a >1h idle gap, ~$944 of write premium at fable-5 rates
+   * that this converts to ~$308 of reads.
+   *
+   * Cost is proportional to actual idleness, not to `maxIdleHours` — a busy
+   * agent never fires one, because its own traffic already refreshes the TTL.
+   */
+  cacheKeepalive?: {
+    /** Default true (anthropic provider only). */
+    enabled?: boolean;
+    /** Stop refreshing this long after the last REAL request. Default 24. */
+    maxIdleHours?: number;
+    /** Refresh once untouched this long. Must be < 60 with a 1h TTL. Default 45. */
+    refreshAfterMinutes?: number;
+  };
   /**
    * Explicit prompt-caching override. Unset means provider-appropriate
    * default: on for everything except bedrock models that predate caching
@@ -709,6 +747,18 @@ export interface Recipe {
   /** Deployment-specific code extensions, keyed by a human-readable name. */
   extensions?: Record<string, RecipeExtension>;
   sessionNaming?: { examples?: string[] };
+  /**
+   * Channel id used as the LAST-RESORT outbound locus for plain-text speech
+   * (agent-framework `FrameworkConfig.fallbackLocusChannel`), e.g.
+   * `"discord:<guildId>:<channelId>"`. Consulted only when the turn has no
+   * home channel, no triggering channel, and no most-recent inbound — the
+   * window between a restart and the first inbound message, in which a
+   * heartbeat / workspace-event / reminder wake otherwise has nowhere to
+   * speak and its prose is archived (docs/LOCUS-ROUTING-DESIGN.md, "Interim
+   * state"). Set it only for single-door deployments; omit for multi-surface
+   * agents, which must keep the never-guess behavior.
+   */
+  fallbackLocusChannel?: string;
   /** Client-side programmatic tool calling (code_execution tool). */
   codeExecution?: RecipeCodeExecution;
 }
@@ -921,6 +971,11 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error('Recipe agent must have a "systemPrompt" string');
   }
 
+  if (obj.fallbackLocusChannel !== undefined
+      && (typeof obj.fallbackLocusChannel !== 'string' || !obj.fallbackLocusChannel.trim())) {
+    throw new Error('Recipe "fallbackLocusChannel" must be a non-empty channel id string');
+  }
+
   if (agent.provider !== undefined &&
       agent.provider !== 'anthropic' &&
       agent.provider !== 'openai-responses' &&
@@ -989,6 +1044,37 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.cacheTtl must be '5m' or '1h', got ${JSON.stringify(agent.cacheTtl)}.`);
   }
   agent.cacheTtl ??= '1h';
+
+  // A keepalive that fires AFTER the entry has already expired is the worst of
+  // both worlds: it pays a full 2x cache write on every poke, forever, and
+  // reports success while doing it. Refuse the config rather than discover it
+  // in a bill. (The runtime also self-checks — see membrane cache-keepalive —
+  // but a typo'd recipe should never get that far.)
+  const keepalive = agent.cacheKeepalive;
+  if (keepalive !== undefined) {
+    if (typeof keepalive !== 'object' || keepalive === null) {
+      throw new Error(`Recipe agent.cacheKeepalive must be an object, got ${JSON.stringify(keepalive)}.`);
+    }
+    const { maxIdleHours, refreshAfterMinutes } = keepalive as {
+      maxIdleHours?: unknown;
+      refreshAfterMinutes?: unknown;
+    };
+    if (refreshAfterMinutes !== undefined) {
+      if (typeof refreshAfterMinutes !== 'number' || !(refreshAfterMinutes > 0)) {
+        throw new Error(`Recipe agent.cacheKeepalive.refreshAfterMinutes must be a positive number, got ${JSON.stringify(refreshAfterMinutes)}.`);
+      }
+      const ttlMinutes = agent.cacheTtl === '1h' ? 60 : 5;
+      if (refreshAfterMinutes >= ttlMinutes) {
+        throw new Error(
+          `Recipe agent.cacheKeepalive.refreshAfterMinutes (${refreshAfterMinutes}) must be less than the ${agent.cacheTtl} cache TTL (${ttlMinutes}m), ` +
+          'or every keepalive would land after the entry expired and pay a full cache write instead of a read.',
+        );
+      }
+    }
+    if (maxIdleHours !== undefined && (typeof maxIdleHours !== 'number' || !(maxIdleHours > 0))) {
+      throw new Error(`Recipe agent.cacheKeepalive.maxIdleHours must be a positive number, got ${JSON.stringify(maxIdleHours)}.`);
+    }
+  }
 
   if (agent.promptCaching !== undefined && typeof agent.promptCaching !== 'boolean') {
     throw new Error(

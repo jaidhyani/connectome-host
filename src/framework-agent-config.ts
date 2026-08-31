@@ -67,7 +67,17 @@ export function buildFrameworkAgentConfig(
   return {
     name: agentName,
     model,
-    systemPrompt: recipe.agent.systemPrompt,
+    systemPrompt: recipe.agent.systemPrompt +
+      (recipe.agent.strategy?.compressionMode === 'inline'
+        ? '\n\nYour context is chronological. It begins with memories — compressed versions of ' +
+          'your earlier experience, labeled by level: [L3] memories are the oldest and broadest, ' +
+          '[L2] narrower, [L1] the most recent and specific. After the memories, your latest ' +
+          'experience appears as raw conversation, with [Fold boundary] markers showing where ' +
+          'compression boundaries fall. Periodically, the Context Manager will ask you to form ' +
+          'a new memory — compressing the oldest uncompressed material (up to the first ' +
+          '[Fold boundary]) into an [L1], or consolidating existing memories into a higher level. ' +
+          'Your most recent experience is never compressed; it stays raw.'
+        : ''),
     maxTokens: recipe.agent.maxTokens ?? 16384,
     maxStreamTokens: recipe.agent.maxStreamTokens ?? 150000,
     contextBudgetTokens: recipe.agent.contextBudgetTokens,
