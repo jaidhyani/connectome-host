@@ -709,6 +709,18 @@ export interface Recipe {
   /** Deployment-specific code extensions, keyed by a human-readable name. */
   extensions?: Record<string, RecipeExtension>;
   sessionNaming?: { examples?: string[] };
+  /**
+   * Channel id used as the LAST-RESORT outbound locus for plain-text speech
+   * (agent-framework `FrameworkConfig.fallbackLocusChannel`), e.g.
+   * `"discord:<guildId>:<channelId>"`. Consulted only when the turn has no
+   * home channel, no triggering channel, and no most-recent inbound — the
+   * window between a restart and the first inbound message, in which a
+   * heartbeat / workspace-event / reminder wake otherwise has nowhere to
+   * speak and its prose is archived (docs/LOCUS-ROUTING-DESIGN.md, "Interim
+   * state"). Set it only for single-door deployments; omit for multi-surface
+   * agents, which must keep the never-guess behavior.
+   */
+  fallbackLocusChannel?: string;
   /** Client-side programmatic tool calling (code_execution tool). */
   codeExecution?: RecipeCodeExecution;
 }
@@ -919,6 +931,11 @@ export function validateRecipe(raw: unknown): Recipe {
   const agent = obj.agent as Record<string, unknown>;
   if (typeof agent.systemPrompt !== 'string' || !agent.systemPrompt) {
     throw new Error('Recipe agent must have a "systemPrompt" string');
+  }
+
+  if (obj.fallbackLocusChannel !== undefined
+      && (typeof obj.fallbackLocusChannel !== 'string' || !obj.fallbackLocusChannel.trim())) {
+    throw new Error('Recipe "fallbackLocusChannel" must be a non-empty channel id string');
   }
 
   if (agent.provider !== undefined &&

@@ -498,6 +498,10 @@ agents: [agentConfig],
     mcplServers: finalServers,
     gate: gateOptions,
     timeZone,
+    // Single-door deployments name a last-resort speech locus so a
+    // post-restart heartbeat / workspace-event wake still reaches the human
+    // instead of archiving (recipe.fallbackLocusChannel).
+    ...(recipe.fallbackLocusChannel ? { fallbackLocusChannel: recipe.fallbackLocusChannel } : {}),
     // Client-side programmatic tool calling (code_execution) — recipe opt-in.
     ...(recipe.codeExecution ? { codeExecution: recipe.codeExecution } : {}),
   });
