@@ -66,6 +66,7 @@ import {
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
 import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
 import { buildFrameworkStrategy } from './framework-strategy.js';
+import { logKeepaliveEvent } from './cache-keepalive-log.js';
 import { loadExtensions } from './extensions.js';
 
 export type { AppContext };
@@ -933,6 +934,24 @@ async function main() {
                   : {}),
               }),
           baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+          // Hold this agent's cached prefix warm across idle gaps. Only fires
+          // when the entry is actually near expiry, so a busy agent costs
+          // nothing; only the 1h-TTL primary lane is eligible (the module
+          // skips anything else). Off with cacheKeepalive.enabled: false.
+          cacheKeepalive: {
+            enabled: recipe.agent.cacheKeepalive?.enabled !== false,
+            ...(recipe.agent.cacheKeepalive?.maxIdleHours !== undefined
+              ? { maxIdleMs: recipe.agent.cacheKeepalive.maxIdleHours * 60 * 60_000 }
+              : {}),
+            ...(recipe.agent.cacheKeepalive?.refreshAfterMinutes !== undefined
+              ? { refreshAfterMs: recipe.agent.cacheKeepalive.refreshAfterMinutes * 60_000 }
+              : {}),
+            // Every event — routine refreshes included — goes to stderr, so
+            // all of them land in the log an operator actually reads
+            // (upstream fix e3149ed, #99: 'refreshed' on stdout made a
+            // working keepalive look dead to a stderr-tailing monitor).
+            onEvent: logKeepaliveEvent,
+          },
         },
         llmLogPath,
         () => settingsModule.getReasoning(),

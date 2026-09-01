@@ -1,0 +1,1474 @@
+/**
+ * Recipe system — config-driven agent bootstrapping.
+ *
+ * A recipe defines everything domain-specific about an agent session:
+ * system prompt, MCP servers, which modules to enable, and naming hints.
+ *
+ * Recipes can be loaded from:
+ *   - HTTP(S) URLs
+ *   - Local file paths
+ *   - Saved state from a previous run (data/.recipe.json)
+ *   - Built-in default (generic assistant)
+ */
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { dirname, isAbsolute, resolve } from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface RecipeStrategy {
+  /** Built-in strategy name, or a custom type registered by a
+   *  `kind: "strategy"` extension (see `Recipe.extensions`). The
+   *  `string & {}` arm keeps literal autocompletion while admitting
+   *  extension-registered names. */
+  type: 'autobiographical' | 'passthrough' | 'frontdesk' | (string & {});
+  // Core window/compression sizing
+  headWindowTokens?: number;
+  recentWindowTokens?: number;
+  compressionModel?: string;
+  /** Cap compression `max_tokens` at the compression model's OUTPUT ceiling.
+   *  Required for pre-4.x models (Claude 3 Opus caps at 4096) — without it the
+   *  summarizer's 16k floor is rejected and the agent never folds. */
+  compressionMaxTokens?: number;
+  maxMessageTokens?: number;
+  overBudgetGraceRatio?: number;
+  // Compression/merge tuning passed through to the underlying
+  // autobiographical strategy (and frontdesk, which extends it).
+  // Declared here so a typo in a recipe (e.g. `l1BudgetTokes`) fails
+  // at recipe validation rather than silently defaulting at strategy
+  // construction. Keep in sync with `AutobiographicalConfig` in
+  // @animalabs/context-manager; this interface is the source of truth
+  // for what the recipe loader accepts under `agent.strategy`.
+  enforceBudget?: boolean;
+  maxSpeculativeL1s?: number;
+  /** Number of coverage-equivalent recall curves to try after the canonical
+   * autobiographical compression request is explicitly refused. Zero disables
+   * fallback while retaining the canonical attempt. */
+  compressionRefusalCurveFallbacks?: number;
+  /** Complete provider-request admission ceiling for compression fallbacks,
+   * including the output reserve. */
+  compressionContextBudgetTokens?: number;
+  positionedRecallPairs?: boolean;
+  recallHeaderTemplate?: string;
+  targetChunkTokens?: number;
+  mergeThreshold?: number;
+  summaryTargetTokens?: number;
+  l1BudgetTokens?: number;
+  l2BudgetTokens?: number;
+  l3BudgetTokens?: number;
+  toolResultMaxLastN?: number;
+  toolUseInputMaxTokens?: number;
+  // Adaptive resolution (document-based gradual compression). For the
+  // 'autobiographical' strategy type this defaults ON (see index.ts); set
+  // `adaptiveResolution: false` to opt back to the count-based hierarchical
+  // renderer. The remaining knobs only apply when adaptiveResolution is true.
+  adaptiveResolution?: boolean;
+  /** kv-stable: trust region P on per-turn perturbation (tokens re-read).
+   *  See context-manager adaptive-resolution-design.md §13. */
+  kvStableReachTokens?: number;
+  /** kv-stable: quality-gap override threshold (§13.4). Default 0.35. */
+  kvStableQualityGapRatio?: number;
+  compressionSlackRatio?: number;
+  /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
+   *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
+   *  only to opt into the legacy planners. */
+  foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable';
+  speculativeProduction?: boolean;
+  /** L1 production holdback: keep the newest N closed chunks out of the
+   *  speculative compression queue (default 1); demand still overrides. */
+  l1HoldbackChunks?: number;
+  // Self-voice / compression framing. The host defaults summaryParticipant to
+  // `agent.name` (buildFrameworkStrategy), so self-recollections speak as the
+  // agent itself. Set explicitly only to voice summaries as someone else —
+  // a mismatched participant surfaces in the compiled prompt as another voice
+  // speaking in first person about the agent.
+  summaryParticipant?: string;
+  summarySystemPrompt?: string;
+  summaryUserPrompt?: string;
+  summaryContextLabel?: string;
+  /** As-of perspective pin: chunks wholly below this message sequence are
+   *  compressed as inherited/witnessed record, not first-person memory.
+   *  For residents continued from a shared log they joined partway through. */
+  witnessedBeforeSequence?: number;
+  /** Override wording for the witnessed-record instruction ({targetTokens}
+   *  substituted). */
+  witnessedInstruction?: string;
+  /** Identity reminder appended to every compression/merge instruction.
+   *  For agents in multi-resident channels (and older models especially):
+   *  names the agent and directs attribution so pure-witness chunks don't
+   *  flip the summarizer into another speaker's identity. */
+  identityReminder?: string;
+}
+
+export interface RecipeAgent {
+  name?: string;
+  model?: string;
+  /** IANA zone used when rendering wall-clock times to the agent. */
+  timezone?: string;
+  /** Provider transport. Omitted preserves the historical Anthropic default. */
+  provider?: 'anthropic' | 'openai-responses' | 'openai-codex' | 'openrouter' | 'bedrock';
+  /** Message formatter. 'native' (default) = structured user/assistant turns.
+   * 'anthropic-xml' = classic prefill format ("participant: text" runs, XML
+   * tools) — for migrating prefill-era bots (chapterx borgs) with their exact
+   * prompting structure intact. */
+  formatter?: 'native' | 'anthropic-xml';
+  /** Prefill scaffold user message appended after the conversation (e.g.
+   * chapterx CLI-sim's "<cmd>cat untitled.txt</cmd>"). Prefill formatter only. */
+  prefillUserMessage?: string;
+  systemPrompt: string;
+  maxTokens?: number;
+  /**
+   * Per-agent stream token budget — the accumulated-input ceiling at which the
+   * framework breaks the stream and lets the strategy compress. Mirrors the
+   * runtime `/budget` command. When unset, the framework default (150k) applies.
+   */
+  maxStreamTokens?: number;
+  /** Per-agent context compile budget (input tokens). When unset, the
+   *  ContextManager default (100k) applies. Raise for large-context models. */
+  contextBudgetTokens?: number;
+  /** Prompt-cache TTL ('5m' | '1h') forwarded to the provider. Defaults to
+   *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads.
+   *  Not forwarded on bedrock — that transport only has the default 5m
+   *  cache and rejects the ttl field. */
+  cacheTtl?: '5m' | '1h';
+  /**
+   * Explicit prompt-caching override. Unset means provider-appropriate
+   * default: on for everything except bedrock models that predate caching
+   * support there (see bedrockModelSupportsPromptCaching). Set false if a
+   * transport/account rejects cache_control markers — AWS's "your request
+   * did not allow prompt caching" can also be account/region-dependent.
+   */
+  promptCaching?: boolean;
+  /**
+   * Same-round routing policy for ordinary text emitted beside think().
+   * Omitted preserves the compatibility carry-forward in Agent Framework.
+   */
+  sameRoundThinkTextPolicy?: 'public' | 'private';
+  /**
+   * Prose delivery mode (agent-framework docs/explicit-prose-routing.md).
+   * 'explicit' = model prefixes plain text with `>>destination`; unprefixed
+   * prose bounces to a clipboard instead of auto-routing. Default 'locus'.
+   */
+  proseRouting?: 'locus' | 'explicit';
+  /**
+   * Extra Anthropic beta flags sent as the `anthropic-beta` header on every
+   * request (e.g. `["context-1m-2025-08-07"]` for the 1M context window on
+   * models where it is opt-in, like claude-sonnet-4-5). Merged with any
+   * transport-required betas (OAuth). Anthropic provider only.
+   */
+  anthropicBetas?: string[];
+  strategy?: RecipeStrategy;
+  /**
+   * Native extended thinking. When `enabled: true`, the agent's API requests
+   * include Anthropic's thinking config and responses carry signed `thinking`
+   * blocks. Required for matching the cognitive mode of claude.ai web Sonnet.
+   */
+  thinking?: {
+    enabled: boolean;
+    budgetTokens?: number;
+    /** 'enabled' (explicit budget, legacy) or 'adaptive' (model-managed;
+     * required by opus-4-7+ / fable-5 era models). */
+    type?: 'enabled' | 'adaptive';
+    /** 'summarized' returns readable reasoning summaries in `thinking`;
+     * 'omitted' returns empty text + signature only. Models 4.7+ default
+     * to 'omitted' server-side. */
+    display?: 'summarized' | 'omitted';
+  };
+  /** OpenAI Responses settings. Reasoning applies to both OpenAI providers;
+   * compaction and serviceTier are API-key transport settings. */
+  responses?: {
+    reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    reasoningContext?: 'current_turn' | 'all_turns';
+    compactThreshold?: number;
+    /** OpenAI Responses API processing tier. `priority` is the API-key
+     * equivalent of Codex fast mode. */
+    serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
+  };
+  /** ChatGPT-subscription Codex settings. Only used with
+   * `provider: "openai-codex"`. Runtime `/fast` overrides fastMode. */
+  codex?: {
+    fastMode?: boolean;
+  };
+  /**
+   * Content-refusal handling. When `autoRewind` is on, a `stop_reason: refusal`
+   * turn triggers an automatic rewind of the triggering turn + retry (keeping
+   * the agent on its own model). See agent-framework AgentConfig.refusalHandling.
+   */
+  refusalHandling?: {
+    autoRewind?: boolean;
+    maxRewinds?: number;
+    announceHumanTurns?: boolean;
+  };
+}
+
+export interface RecipeMcpServer {
+  /** Command to spawn (stdio transport). Mutually exclusive with url. */
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  /** WebSocket URL (WebSocket transport). Mutually exclusive with command. */
+  url?: string;
+  transport?: 'stdio' | 'websocket';
+  /** Bearer token for WebSocket auth (appended as ?token= query param). */
+  token?: string;
+  /**
+   * Name of a host-managed access grant (archipelago audience, e.g.
+   * "eidoverse"). Requires the `identity` module. The host resolves fresh
+   * credentials per dial; neither the recipe nor the agent holds one.
+   */
+  access?: string;
+  toolPrefix?: string;
+  enabledFeatureSets?: string[];
+  disabledFeatureSets?: string[];
+  /**
+   * Tool allow-list (bare tool names as the server exports them, no toolPrefix).
+   * `*` is a substring wildcard (`read_*`, `*_file`, `*`).
+   * If set, only matching tools are exposed to the model AND callable at dispatch.
+   */
+  enabledTools?: string[];
+  /**
+   * Tool deny-list (same syntax as enabledTools). Wins over enabledTools on overlap.
+   * Denied tools are hidden from the model and rejected at dispatch — both, so a
+   * model that imitates a prior call from message history can't sneak the call through.
+   */
+  disabledTools?: string[];
+  reconnect?: boolean;
+  /** Base reconnect interval; the framework doubles it per consecutive
+   *  failure (with jitter) up to reconnectMaxIntervalMs. */
+  reconnectIntervalMs?: number;
+  /** Ceiling for the exponential reconnect backoff. Default: 5 minutes. */
+  reconnectMaxIntervalMs?: number;
+  /**
+   * @deprecated One-time migration input for legacy recipes. Runtime channel
+   * desired state is Chronicle-backed and changed with channel_open/close.
+   */
+  channelSubscription?: 'auto' | 'manual' | string[];
+  /**
+   * Optional install metadata for build/deploy tooling (e.g. connectome-cook).
+   * Ignored by the recipe loader at runtime — agents don't need this; only
+   * tools that produce deployable artifacts (Docker images, etc.) do.
+   */
+  source?: RecipeMcpServerSource;
+  /**
+   * Auxiliary credential / config files this MCP server needs at runtime
+   * (e.g. `.zuliprc` for the Zulip adapter, `~/.netrc` for HTTP-auth APIs,
+   * a `gcloud.json` service-account key for Google APIs).  Build tooling
+   * collects values from the operator (env vars or interactive prompts),
+   * writes the file, and bind-mounts it into the container.  The recipe
+   * loader itself does NOT touch these — the runtime reads the file via
+   * whatever path the MCP server expects (typically declared in `env`).
+   *
+   * Like `source`, this is build-tooling metadata.  Ignored at runtime.
+   */
+  credentialFiles?: RecipeCredentialFile[];
+}
+
+/**
+ * How to obtain and install an MCP server at deploy time.  Consumed by
+ * build tooling like connectome-cook.  All fields optional-at-the-schema-
+ * layer except `url`; tools may require more depending on the install
+ * pattern they're generating.
+ */
+export interface RecipeMcpServerSource {
+  /** Git URL to clone from. */
+  url: string;
+  /**
+   * Git ref: branch, tag, or commit SHA.  Default: "main".
+   * If the value starts with "refs/" (e.g. "refs/pull/3/head"), it's
+   * treated as an explicit refspec — tools fetch it then check out
+   * FETCH_HEAD.  Useful for tracking PR heads on GitHub/GitLab.
+   */
+  ref?: string;
+  /**
+   * How to install inside the cloned dir at build time.
+   *   "npm"           runs `npm install && npm run build`; implies node runtime.
+   *   "pip-editable"  creates a venv at `.venv/` and runs `pip install -e .`;
+   *                   implies python3 runtime.
+   *   { run, runtime } runs an arbitrary shell command from the cloned dir;
+   *                   `runtime` tells the tool which base packages to install
+   *                   in the image (node / python3 / custom / bun = no defaults).
+   * Omit entirely for sources that need no build step (e.g. the tool is
+   * fetched at runtime by npx/uvx — the recipe's `command` is enough).
+   */
+  install?:
+    | 'npm'
+    | 'pip-editable'
+    | { run: string; runtime: 'node' | 'python3' | 'custom' | 'bun' };
+  /**
+   * Build-arg name for an auth token if the URL is private.
+   * Tools consuming `source` should mount this via BuildKit secrets
+   * (so the token doesn't leak into image layers).  The same env var
+   * name is typically already needed at runtime by the operator's
+   * `.env`, so this field doesn't introduce new secret surface.
+   */
+  authSecret?: string;
+  /**
+   * True if the URL's TLS cert isn't in the container's trust store
+   * (e.g. self-signed internal CAs on private GitLab/Gitea).  Tools
+   * should add `-c http.sslVerify=false` to the git clone of this source.
+   * Prefer installing a proper CA bundle in the image over using this flag.
+   */
+  sslBypass?: boolean;
+  /**
+   * Override the in-container path of the installed source.  Default:
+   * `/<basename-of-url-without-.git-suffix>` (e.g. the URL
+   * `https://github.com/x/zulip_mcp.git` places the source at `/zulip_mcp`).
+   */
+  inContainer?: { path: string };
+  /**
+   * Extra apt packages this source needs in the runtime image (e.g.
+   * `ffmpeg`/`curl` for a tool that shells out to them).  Build tooling
+   * appends these to the runtime stage's apt install; connectome-host
+   * ignores the field at runtime (it doesn't build images).
+   */
+  systemPackages?: string[];
+}
+
+/**
+ * One auxiliary credential or config file the MCP server reads at runtime.
+ * Build tooling (cook, etc.) prompts the operator for the field values,
+ * serializes them in the declared format, and writes the file at the
+ * declared path so the bind-mounted file appears in the container.
+ *
+ * Example for Zulip's `.zuliprc`:
+ * ```json
+ * {
+ *   "path": "./.zuliprc",
+ *   "format": "ini",
+ *   "section": "api",
+ *   "mode": "0600",
+ *   "fields": [
+ *     { "name": "email", "envOverride": "ZULIP_EMAIL", "placeholder": "bot@example.zulipchat.com" },
+ *     { "name": "key",   "envOverride": "ZULIP_KEY",   "placeholder": "abc123...", "secret": true },
+ *     { "name": "site",  "envOverride": "ZULIP_SITE",  "placeholder": "https://example.zulipchat.com" }
+ *   ]
+ * }
+ * ```
+ */
+export interface RecipeCredentialFile {
+  /** Where the runtime expects the file.  In a Docker context this also
+   *  determines the bind-mount target; the host-side path is `<outDir>` +
+   *  basename(path).  Relative paths resolve against the conductor's CWD
+   *  (typically `/app`); absolute paths land verbatim. */
+  path: string;
+  /** Serialization format.  `ini` writes `key=value` lines under an
+   *  optional `[section]` header; `json` writes `{ "field": "value", ... }`;
+   *  `env` writes `KEY=value` (no quoting). */
+  format: 'ini' | 'json' | 'env';
+  /** Optional INI section header (`[<section>]`) preceding the fields.
+   *  Ignored by `json` / `env` formats. */
+  section?: string;
+  /** Filesystem mode as an octal string.  Default `0600` (typical for
+   *  credentials).  Build tooling sets this on the host file before bind-
+   *  mounting; the container inherits the mode through the mount. */
+  mode?: string;
+  /** Fields the operator must supply. */
+  fields: RecipeCredentialFileField[];
+}
+
+export interface RecipeCredentialFileField {
+  /** Field name as written in the file (e.g. `email`, `key`, `site`).
+   *  For `ini` / `env` formats this is the literal key.  For `json` it
+   *  becomes the JSON property name. */
+  name: string;
+  /** Optional env var name that, when set in `process.env` (or supplied
+   *  via cook's `--env-file`), substitutes for prompting.  Lets the
+   *  operator pre-set values in CI / scripted contexts. */
+  envOverride?: string;
+  /** Operator-facing description of what to enter (one short line). */
+  description?: string;
+  /** Placeholder shown next to the prompt (e.g. `bot@example.zulipchat.com`). */
+  placeholder?: string;
+  /** When true, build tooling masks the input (no echo while typing).
+   *  Default `false`. */
+  secret?: boolean;
+}
+
+/**
+ * Subset of MountConfig exposed to recipes.
+ * Intentionally omits watchDebounceMs, followSymlinks, and maxFileSize —
+ * these are implementation details best left to framework defaults.
+ */
+export interface RecipeWorkspaceMount {
+  name: string;
+  path: string;
+  mode?: 'read-write' | 'read-only';
+  watch?: 'always' | 'on-agent-action' | 'never';
+  ignore?: string[];
+  /**
+   * Request inference when files in this mount change. Pair with
+   * `watch: 'always'` so chokidar actually observes the mount.
+   * - `true` — any of created | modified | deleted
+   * - array — only the listed ops
+   */
+  wakeOnChange?: boolean | Array<'created' | 'modified' | 'deleted'>;
+  /**
+   * Persist every write/edit/delete to disk immediately. Required for mounts
+   * shared across agents as a communication channel (tickets, reports, etc.)
+   * so other agents' chokidar watchers actually see the change.
+   */
+  autoMaterialize?: boolean;
+}
+
+export interface RecipeModules {
+  /**
+   * Subagent forking (spawn/fork parallel agents). OPT-IN — defaults to off
+   * and is not part of the standard recipe.
+   */
+  subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
+  /**
+   * Lesson library (persistent knowledge store + lesson tools). OPT-IN —
+   * defaults to off and is not part of the standard recipe.
+   */
+  lessons?: boolean;
+  /**
+   * Lesson retrieval-injection (requires `lessons`). OPT-IN — defaults to off
+   * and is deliberately not part of the standard recipe: it injects
+   * context-dependent content into every compile and spends up to two
+   * configured retrieval-model calls. Enable only for agents that actually
+   * curate a lesson library.
+   */
+  retrieval?: boolean | {
+    model?: string;
+    maxInjected?: number;
+    /**
+     * Optional OpenAI Responses/Codex reasoning effort for both retrieval calls.
+     * Requires an explicit retrieval model.
+     */
+    reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+  };
+  wake?: boolean | import('@animalabs/agent-framework').GateConfig;
+  workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
+  /**
+   * Surface agent composition activity (typing indicators) to one or more
+   * MCPL channels while inference is active. Opt-in per recipe; channel IDs
+   * use the MCPL format (e.g. `zulip:tracker-miner-f`). The agent can also
+   * adjust the set at runtime via the `activity:show_in` / `activity:hide_in`
+   * tools.
+   */
+  activity?: boolean | { channels?: string[] };
+  /**
+   * MCPL self-administration. Off by default. When enabled, the agent gets
+   * `mcpl_list` / `mcpl_deploy` / `mcpl_restart` / `mcpl_unload` tools to
+   * hot-manage its own MCPL servers without a host restart. Deployments
+   * persist to `mcpl-servers.agent.json` (the agent overlay), merged over the
+   * recipe/file server list at startup.
+   *
+   * SECURITY: `mcpl_deploy` spawns arbitrary commands as the host user —
+   * enabling this module means trusting the agent with code execution.
+   *
+   * `{ surface: 'utilities' }` keeps the module but parks its four tools
+   * behind the framework's single `utils` meta-tool (mcpl management is
+   * rare; it needn't cost four schemas on every inference). `true` keeps
+   * the historical first-class surface.
+   */
+  mcplAdmin?: boolean | { surface?: 'tools' | 'utilities' };
+
+  /**
+   * The agent's own archipelago-home identity (connectome docs/home-node.md):
+   * an ed25519 keypair in the data dir, enrolled at the home node via an
+   * operator invite, exchanged for fresh aid1 audience tokens on demand.
+   * Utilities-only (`utils run identity--status/enroll/token`) — costs no
+   * tool slots. `home` defaults to id.animalabs.ai; `audience` is the
+   * default for `token` calls.
+   */
+  identity?: boolean | { home?: string; audience?: string };
+  /**
+   * Cross-process child fleet.  When true (shorthand), FleetModule is attached
+   * with no pre-configured children.  When an object, declares children the
+   * conductor supervises (auto-started by default on framework start) and
+   * optionally an allowlist of recipe paths the conductor may spawn at will.
+   * Recipes outside the allowlist require user approval.
+   *
+   * Recipe path resolution: relative paths in `children[].recipe` are resolved
+   * at load time against the directory of the parent recipe file (or URL
+   * base), NOT the process CWD. This lets a recipe bundle live anywhere on
+   * disk and reference its siblings portably. Absolute paths and http(s)
+   * URLs pass through unchanged.
+   *
+   * Note: this differs from runtime paths (workspace mounts, `dataDir`),
+   * which stay CWD-relative because they describe where the running process
+   * puts its state.
+   */
+  fleet?: boolean | RecipeFleet;
+
+  /**
+   * Web admin UI. Off by default. The default bind is 0.0.0.0:7340 (connectome
+   * deployments are remote, not local), which hard-requires Basic-Auth: a
+   * recipe that enables webui MUST supply `basicAuth`, or the host refuses to
+   * start. Credentials should be `${VAR}`-substituted from .env, never literal.
+   *
+   * For remote admin, front this with a reverse proxy (Caddy/nginx) for TLS;
+   * Basic-Auth is still required at the app layer. Set `host: '127.0.0.1'` to
+   * bind loopback-only for local development, which skips the auth requirement.
+   */
+  webui?: boolean | RecipeWebUi;
+
+  /**
+   * Live TTS streaming tap (melodeus-tts-relay). Off by default. When set,
+   * the host mirrors the agent's streaming generation — chunks, block
+   * boundaries, activation start/end, tagged with the turn's channel — to the
+   * relay's `/bot` WebSocket, where voice clients (Melodeus / iOS) speak it.
+   * Also handles the relay's `interruption` events: the just-posted Discord
+   * message is edited down to the words actually voiced, and a note lands in
+   * the agent's context. Pure trace-bus tap — no effect on the agent loop.
+   * `token` should be `${VAR}`-substituted from .env, never literal.
+   */
+  ttsRelay?: RecipeTtsRelay;
+
+  /**
+   * Auto-unsubscribe noisy ambient channels. On by default. Per subscribed
+   * channel, the host counts ambient (non-mention, non-DM) characters since the
+   * agent's last activation; when a channel crosses its limit before the next
+   * activation, it's auto-unsubscribed (delivery stops, and the surface starts
+   * tracking what's then missed). Counters reset on every activation — the
+   * agent sees all subscribed channels in context, compressed if large — and
+   * persist across restarts. The agent can override the per-channel limit at
+   * runtime via `agent_settings` (field `channel_idle_limits`).
+   *
+   * `false` disables entirely. `defaultLimitChars` sets the global default
+   * (20000 if omitted). `serverId`/`toolPrefix` target the MCPL surface that
+   * owns subscriptions (defaults: `discord` / `mcpl--discord`).
+   */
+  subscriptionGc?:
+    | boolean
+    | { defaultLimitChars?: number; serverId?: string; toolPrefix?: string };
+
+  /**
+   * One-step channel attention modes (the `set_channel_mode` tool): flip a
+   * channel between mentions-only and every-message-debounced. Debounced mode
+   * bundles subscribe + a per-channel ambient debounce gate rule + pinning
+   * subscription-gc off; mentions mode reverses all three. On by default when
+   * the gate (`wake`) is enabled — it only ADDS a tool, inert until called.
+   * `false` disables. `serverId`/`toolPrefix` target the MCPL surface that owns
+   * subscriptions (defaults: `discord` / `mcpl--discord`); `defaultDebounceMs`
+   * sets the debounced-mode quiet window (180000 if omitted).
+   */
+  channelMode?:
+    | boolean
+    | { serverId?: string; toolPrefix?: string; gcModuleName?: string; defaultDebounceMs?: number };
+}
+
+export interface RecipeWebUi {
+  port?: number;
+  host?: string;
+  /**
+   * Where the observer grant tools (observers--get/grant/revoke) surface:
+   * 'tools' (default, historical) or 'utilities' (behind the `utils`
+   * meta-tool — grant edits are rare). Consent semantics unchanged: the
+   * agent holds the pen either way.
+   */
+  observersSurface?: 'tools' | 'utilities';
+  /**
+   * Basic-Auth credentials. Required whenever the bind host is non-loopback
+   * (which is the default). `${VAR}`-substitutable from .env.
+   */
+  basicAuth?: { username: string; password: string };
+  /**
+   * Override the default Origin allowlist for the WebSocket upgrade. Default
+   * is `http(s)://127.0.0.1:<port>` and `http(s)://localhost:<port>`. Add
+   * your reverse-proxy origin (e.g. `https://admin.example.com`) here when
+   * fronted by Caddy/nginx. Pass `[]` to disable the Origin check entirely
+   * — only sensible when something else upstream is enforcing it.
+   */
+  allowedOrigins?: string[];
+}
+
+export interface RecipeTtsRelay {
+  /** Relay bot endpoint, e.g. "ws://localhost:8800/bot". */
+  url: string;
+  /** Shared secret for the relay's /bot auth (its BOT_TOKENS). */
+  token: string;
+  /** Relay-side bot identifier. Defaults to the agent's name. */
+  botId?: string;
+  /** Discord user id stamped on stream events (client voice-config key).
+   *  Defaults to botId. */
+  userId?: string;
+  /** Display name stamped on stream events. Defaults to the agent's name. */
+  username?: string;
+  /** MCPL server id owning `edit_message` for interruption trims. Default 'discord'. */
+  editServerId?: string;
+  reconnectIntervalMs?: number;
+  /** Drop a context note when an interruption trims a posted message. Default true. */
+  notifyOnInterruption?: boolean;
+}
+
+export interface RecipeFleet {
+  /** Children to manage. autoStart children launch when the framework starts. */
+  children?: RecipeFleetChild[];
+  /**
+   * Allowlist for `fleet--launch`.  If omitted, the list is implicitly the
+   * set of recipe paths named in `children`.  A launch call targeting a
+   * recipe outside the allowlist fails with an error the agent should
+   * relay to the user (who can then approve and re-issue).
+   *
+   * Pattern syntax (intentionally minimal to keep matcher and intent aligned):
+   *   - Literal exact match: `"recipes/miner.json"`
+   *   - Single `"*"`: allow everything
+   *   - Trailing `"*"` only (prefix match): `"recipes/*"` matches any path
+   *     under `recipes/`.  A mid-string `*` is rejected at validation time
+   *     — it would look like a glob but behave only as a literal.
+   */
+  allowedRecipes?: string[];
+  /** Default subscription sent to each child at handshake if they don't specify their own. */
+  defaultSubscription?: string[];
+  /**
+   * Spawn-readiness timeouts forwarded to FleetModule.  Bump these when a
+   * child's startup work (heavy MCP servers, large state load) won't fit
+   * inside the FleetModule defaults (15s / 10s / 10s / 5s respectively).
+   */
+  socketWaitTimeoutMs?: number;
+  readyTimeoutMs?: number;
+  gracefulShutdownMs?: number;
+  sigtermEscalationMs?: number;
+}
+
+export interface RecipeFleetChild {
+  name: string;
+  /**
+   * Recipe path or http(s) URL.  Relative paths are resolved at `loadRecipe`
+   * time against the directory of the parent recipe file (or URL base), so
+   * a sibling recipe is referenced by its filename regardless of where the
+   * parent is launched from.  Absolute paths and URLs pass through
+   * unchanged.
+   */
+  recipe: string;
+  /** Data dir override; default `./data/<name>`. */
+  dataDir?: string;
+  /** Env overrides on top of parent env. */
+  env?: Record<string, string>;
+  /**
+   * Event subscription at handshake (supports glob like `tool:*`).
+   * Relevant synthetic events the parent may care about:
+   *   - `lifecycle` (includes `ready` / `idle` / `exiting`) — required for fleet--await.
+   *   - `inference:speech` — per-final-inference speech text, required for fleet--relay.
+   *   - `inference:completed` / `inference:failed` / `tool:completed` / `tool:failed` — useful for status tracking.
+   */
+  subscription?: string[];
+  /** Launch this child on framework start. Default: true. */
+  autoStart?: boolean;
+  /** Respawn on crash (Phase 5 honours this; schema accepts it now). */
+  autoRestart?: boolean;
+}
+
+/**
+ * A deployment-specific code extension: a local TS/JS module that registers
+ * custom context strategies and/or framework modules at boot. See
+ * src/extensions.ts for the loader and the `register(api, config)` contract.
+ */
+export interface RecipeExtension {
+  /** Primary purpose. Gates validation (a non-built-in `agent.strategy.type`
+   *  requires at least one `kind: "strategy"` extension) and informs build
+   *  tooling; does not restrict what `register` may call. */
+  kind: 'strategy' | 'module';
+  /** Path to the extension entry module. Relative paths resolve against the
+   *  recipe file's directory at load time; URL-loaded recipes must use
+   *  absolute paths (the host never imports code over the network). */
+  path: string;
+  /** Opaque blob passed verbatim to the extension's `register` function and
+   *  to module factory contexts. */
+  config?: Record<string, unknown>;
+  /** Build-tooling acquisition metadata (git url/ref/install pattern) —
+   *  consumed by connectome-cook at build time, ignored at runtime. */
+  source?: Record<string, unknown>;
+  /** Build-only provenance: `source` demoted by build tooling into the
+   *  shipped recipe. Ignored at runtime. */
+  sourceMeta?: Record<string, unknown>;
+}
+
+/**
+ * Client-side programmatic tool calling (af `code_execution` tool, af ≥0.7.2).
+ *
+ * SECURITY: like mcpl_deploy, enabling this means trusting the agent with
+ * code execution — model-authored python runs as the host user with the
+ * agent's full tool surface injected. It is a robustness boundary (deadline,
+ * kill, respawn), not a sandbox. The agents we host already have shells;
+ * enable deliberately all the same.
+ */
+export interface RecipeCodeExecution {
+  enabled: boolean;
+  /** Python interpreter (default: python3 from PATH; needs ≥3.8). */
+  pythonPath?: string;
+  /** Per-inner-tool-call timeout, ms (default 270_000). */
+  toolCallTimeoutMs?: number;
+  /** Whole-script deadline, ms (default 600_000). */
+  scriptTimeoutMs?: number;
+  /** Idle interpreter reclaim, ms (default 300_000; 0 disables). */
+  idleReclaimMs?: number;
+}
+
+export interface Recipe {
+  name: string;
+  description?: string;
+  version?: string;
+  agent: RecipeAgent;
+  mcpServers?: Record<string, RecipeMcpServer>;
+  modules?: RecipeModules;
+  /** Deployment-specific code extensions, keyed by a human-readable name. */
+  extensions?: Record<string, RecipeExtension>;
+  sessionNaming?: { examples?: string[] };
+  /**
+   * Channel id used as the LAST-RESORT outbound locus for plain-text speech
+   * (agent-framework `FrameworkConfig.fallbackLocusChannel`), e.g.
+   * `"discord:<guildId>:<channelId>"`. Consulted only when the turn has no
+   * home channel, no triggering channel, and no most-recent inbound — the
+   * window between a restart and the first inbound message, in which a
+   * heartbeat / workspace-event / reminder wake otherwise has nowhere to
+   * speak and its prose is archived (docs/LOCUS-ROUTING-DESIGN.md, "Interim
+   * state"). Set it only for single-door deployments; omit for multi-surface
+   * agents, which must keep the never-guess behavior.
+   */
+  fallbackLocusChannel?: string;
+  /** Client-side programmatic tool calling (code_execution tool). */
+  codeExecution?: RecipeCodeExecution;
+}
+
+// ---------------------------------------------------------------------------
+// Default recipe
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_RECIPE: Recipe = {
+  name: 'Agent',
+  description: 'General-purpose assistant with tool access',
+  agent: {
+    name: 'agent',
+    cacheTtl: '1h',
+    systemPrompt: [
+      'You are a helpful assistant. You have access to tools provided by connected MCP servers.',
+      'Use them to help the user with their tasks.',
+      '',
+      'You can create persistent notes and write files to `products/` as outputs of your work.',
+    ].join('\n'),
+  },
+  modules: {
+    // subagents + lessons + retrieval deliberately omitted — all opt-in only
+    // (retrieval additionally adds per-turn context churn + retrieval-model costs);
+    // see the RecipeModules field docs.
+    wake: true,
+    workspace: true,
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Environment variable substitution
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk a parsed-JSON value tree and substitute `${VAR_NAME}` patterns in
+ * string values with `process.env.VAR_NAME`.  Applied at recipe-load time,
+ * before schema validation, so secrets can live in `.env` (gitignored) while
+ * the recipe itself stays commit-safe.
+ *
+ * Patterns:
+ *   - `${FOO}` — required.  Throws if FOO is unset (empty string OK).
+ *   - `${FOO:-default}` — optional.  Uses FOO when set and non-empty,
+ *     otherwise the literal default text.  Default may be empty
+ *     (`${FOO:-}`) to mean "use FOO or just empty string, never throw".
+ *   - VAR name: `[A-Za-z_][A-Za-z0-9_]*`.
+ *   - Default text: any chars except `}`.  No nested `${...}` parsing
+ *     and no escape syntax — keep recipes JSON-friendly.
+ *   - Multiple occurrences in a single string are all substituted.
+ *   - Non-string values (numbers, booleans, nulls) pass through unchanged.
+ *   - Arrays and objects are walked recursively.
+ *
+ * No escape syntax yet — a literal `${...}` in recipe JSON is not a supported
+ * case.  If that becomes needed, add `$$` → `$` unwrapping as a pre-pass.
+ */
+export function substituteEnvVars(value: unknown, source: string): unknown {
+  if (typeof value === 'string') {
+    return value.replace(
+      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
+      (_match, name: string, defaultValue: string | undefined) => {
+        const v = process.env[name];
+        if (defaultValue !== undefined) {
+          // ${VAR:-default} — use VAR if set + non-empty, else default.
+          return v !== undefined && v !== '' ? v : defaultValue;
+        }
+        // ${VAR} — required; empty string is allowed if explicitly set.
+        if (v === undefined) {
+          throw new Error(
+            `Recipe "${source}" references environment variable \${${name}} which is not set. ` +
+            `Add it to your .env file, supply a default with \${${name}:-...}, ` +
+            `or delete the section of the recipe that uses it ` +
+            `(e.g. remove the mcpServers entry for a source you don't have).`,
+          );
+        }
+        return v;
+      },
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => substituteEnvVars(v, source));
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = substituteEnvVars(v, source);
+    }
+    return out;
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+/**
+ * Base for resolving recipe-relative paths (currently: `children[].recipe`).
+ * `file` sources use the recipe file's directory; `url` sources use the URL
+ * base so a child like `"child.json"` on an `https://example.com/parent.json`
+ * load resolves to `https://example.com/child.json`.
+ */
+type RecipeSourceBase = { kind: 'file'; dir: string } | { kind: 'url'; base: string };
+
+/**
+ * Load a recipe from a URL or local file path.
+ * If the systemPrompt value is an HTTP(S) URL, fetches the text.
+ * Recipe string values containing `${VAR}` patterns are substituted against
+ * `process.env` before validation — see substituteEnvVars().
+ * Relative `modules.fleet.children[].recipe` paths are resolved against the
+ * parent recipe's directory (or URL base) so sibling recipes are portable.
+ */
+export async function loadRecipe(source: string): Promise<Recipe> {
+  let raw: unknown;
+  let sourceBase: RecipeSourceBase;
+
+  if (source.startsWith('http://') || source.startsWith('https://')) {
+    const res = await fetch(source);
+    if (!res.ok) throw new Error(`Failed to fetch recipe from ${source}: ${res.status} ${res.statusText}`);
+    raw = await res.json();
+    sourceBase = { kind: 'url', base: source };
+  } else {
+    const path = resolve(source);
+    if (!existsSync(path)) throw new Error(`Recipe file not found: ${path}`);
+    raw = JSON.parse(readFileSync(path, 'utf-8'));
+    sourceBase = { kind: 'file', dir: dirname(path) };
+  }
+
+  raw = substituteEnvVars(raw, source);
+  const recipe = validateRecipe(raw);
+  resolveChildRecipePaths(recipe, sourceBase);
+  resolveExtensionPaths(recipe, sourceBase);
+  return resolveSystemPrompt(recipe);
+}
+
+/**
+ * Resolve a single `children[].recipe` value against the parent recipe's
+ * source base.  Returns unchanged if absolute or http(s) URL.
+ */
+export function resolveRecipeRelative(child: string, base: RecipeSourceBase): string {
+  if (child.startsWith('http://') || child.startsWith('https://')) return child;
+  if (isAbsolute(child)) return child;
+  if (base.kind === 'file') return resolve(base.dir, child);
+  // URL base: resolve the child against the parent URL.
+  return new URL(child, base.base).href;
+}
+
+function resolveChildRecipePaths(recipe: Recipe, base: RecipeSourceBase): void {
+  const fleet = recipe.modules?.fleet;
+  if (!fleet || typeof fleet !== 'object') return;
+  if (!fleet.children) return;
+  for (const child of fleet.children) {
+    child.recipe = resolveRecipeRelative(child.recipe, base);
+  }
+}
+
+/**
+ * Resolve relative `extensions[].path` values against the recipe file's
+ * directory. URL-loaded recipes cannot carry relative extension paths — the
+ * host never fetches code over the network, so there is nothing local to
+ * resolve them against.
+ */
+function resolveExtensionPaths(recipe: Recipe, base: RecipeSourceBase): void {
+  for (const [name, ext] of Object.entries(recipe.extensions ?? {})) {
+    if (isAbsolute(ext.path)) continue;
+    if (base.kind === 'url') {
+      throw new Error(
+        `extensions.${name}.path "${ext.path}" is relative, but the recipe was loaded from a URL. ` +
+        `Extension code is never fetched remotely — use an absolute path to a local install.`,
+      );
+    }
+    ext.path = resolve(base.dir, ext.path);
+  }
+}
+
+/**
+ * If systemPrompt is an HTTP(S) URL, fetch its contents as plain text.
+ * Only treated as a URL if it looks like a single URL (no spaces/newlines).
+ */
+async function resolveSystemPrompt(recipe: Recipe): Promise<Recipe> {
+  const prompt = recipe.agent.systemPrompt;
+  const isUrl = (prompt.startsWith('http://') || prompt.startsWith('https://'))
+    && !prompt.includes(' ') && !prompt.includes('\n');
+  if (isUrl) {
+    const res = await fetch(prompt);
+    if (!res.ok) throw new Error(`Failed to fetch system prompt from ${prompt}: ${res.status} ${res.statusText}`);
+    return {
+      ...recipe,
+      agent: { ...recipe.agent, systemPrompt: await res.text() },
+    };
+  }
+  return recipe;
+}
+
+/**
+ * Validate raw JSON and fill defaults.
+ */
+export function validateRecipe(raw: unknown): Recipe {
+  if (!raw || typeof raw !== 'object') throw new Error('Recipe must be a JSON object');
+  const obj = raw as Record<string, unknown>;
+
+  if (typeof obj.name !== 'string' || !obj.name) {
+    throw new Error('Recipe must have a "name" string');
+  }
+  if (!obj.agent || typeof obj.agent !== 'object') {
+    throw new Error('Recipe must have an "agent" object');
+  }
+
+  const agent = obj.agent as Record<string, unknown>;
+  if (typeof agent.systemPrompt !== 'string' || !agent.systemPrompt) {
+    throw new Error('Recipe agent must have a "systemPrompt" string');
+  }
+
+  if (obj.fallbackLocusChannel !== undefined
+      && (typeof obj.fallbackLocusChannel !== 'string' || !obj.fallbackLocusChannel.trim())) {
+    throw new Error('Recipe "fallbackLocusChannel" must be a non-empty channel id string');
+  }
+
+  if (agent.provider !== undefined &&
+      agent.provider !== 'anthropic' &&
+      agent.provider !== 'openai-responses' &&
+      agent.provider !== 'openai-codex' &&
+      agent.provider !== 'openrouter' &&
+      agent.provider !== 'bedrock') {
+    throw new Error(
+      `Recipe agent.provider must be 'anthropic', 'openai-responses', 'openai-codex', 'openrouter', or 'bedrock', ` +
+      `got ${JSON.stringify(agent.provider)}.`,
+    );
+  }
+
+  if (agent.timezone !== undefined) {
+    if (typeof agent.timezone !== 'string' || !agent.timezone.trim()) {
+      throw new Error('Recipe agent.timezone must be a non-empty IANA time zone string.');
+    }
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: agent.timezone }).format(new Date(0));
+    } catch {
+      throw new Error(`Recipe agent.timezone is not a valid IANA time zone: ${JSON.stringify(agent.timezone)}.`);
+    }
+  }
+
+  if (agent.responses !== undefined) {
+    if (!agent.responses || typeof agent.responses !== 'object' || Array.isArray(agent.responses)) {
+      throw new Error('Recipe agent.responses must be an object.');
+    }
+    const responses = agent.responses as Record<string, unknown>;
+    const efforts = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+    if (responses.reasoningEffort !== undefined && !efforts.includes(String(responses.reasoningEffort))) {
+      throw new Error(`Invalid agent.responses.reasoningEffort ${JSON.stringify(responses.reasoningEffort)}.`);
+    }
+    if (responses.reasoningContext !== undefined && responses.reasoningContext !== 'current_turn' && responses.reasoningContext !== 'all_turns') {
+      throw new Error(`Invalid agent.responses.reasoningContext ${JSON.stringify(responses.reasoningContext)}.`);
+    }
+    if (responses.serviceTier !== undefined && (typeof responses.serviceTier !== 'string' || !responses.serviceTier.trim())) {
+      throw new Error('Recipe agent.responses.serviceTier must be a non-empty string.');
+    }
+    if (responses.compactThreshold !== undefined &&
+        (typeof responses.compactThreshold !== 'number' || responses.compactThreshold <= 0)) {
+      throw new Error('Recipe agent.responses.compactThreshold must be a positive number.');
+    }
+    const serviceTiers = ['auto', 'default', 'flex', 'priority'];
+    if (responses.serviceTier !== undefined && !serviceTiers.includes(String(responses.serviceTier))) {
+      throw new Error(`Invalid agent.responses.serviceTier ${JSON.stringify(responses.serviceTier)}.`);
+    }
+  }
+
+  if (agent.codex !== undefined) {
+    if (!agent.codex || typeof agent.codex !== 'object' || Array.isArray(agent.codex)) {
+      throw new Error('Recipe agent.codex must be an object.');
+    }
+    const codex = agent.codex as Record<string, unknown>;
+    if (codex.fastMode !== undefined && typeof codex.fastMode !== 'boolean') {
+      throw new Error('Recipe agent.codex.fastMode must be a boolean.');
+    }
+  }
+
+  if (agent.maxStreamTokens !== undefined && (typeof agent.maxStreamTokens !== 'number' || agent.maxStreamTokens <= 0)) {
+    throw new Error('Recipe agent.maxStreamTokens must be a positive number.');
+  }
+
+  // Recipes are runtime JSON; a typo'd TTL ("1hr", "60m") would otherwise
+  // surface as a 400 from Anthropic at the agent's first inference.
+  if (agent.cacheTtl !== undefined && agent.cacheTtl !== '5m' && agent.cacheTtl !== '1h') {
+    throw new Error(`Recipe agent.cacheTtl must be '5m' or '1h', got ${JSON.stringify(agent.cacheTtl)}.`);
+  }
+  agent.cacheTtl ??= '1h';
+
+  if (agent.promptCaching !== undefined && typeof agent.promptCaching !== 'boolean') {
+    throw new Error(
+      `Recipe agent.promptCaching must be a boolean, got ${JSON.stringify(agent.promptCaching)}.`,
+    );
+  }
+
+  if (
+    agent.sameRoundThinkTextPolicy !== undefined &&
+    agent.sameRoundThinkTextPolicy !== 'public' &&
+    agent.sameRoundThinkTextPolicy !== 'private'
+  ) {
+    throw new Error(
+      `Recipe agent.sameRoundThinkTextPolicy must be 'public' or 'private', got ${JSON.stringify(agent.sameRoundThinkTextPolicy)}.`,
+    );
+  }
+
+  // Validate agent.thinking if present. Catches typos and constraint
+  // violations (notably max_tokens > budget_tokens) at recipe-load time
+  // rather than as a 400 from Anthropic at first inference.
+  if (agent.thinking !== undefined) {
+    if (!agent.thinking || typeof agent.thinking !== 'object' || Array.isArray(agent.thinking)) {
+      throw new Error('Recipe agent.thinking must be an object with "enabled" and optional "budgetTokens".');
+    }
+    const thinking = agent.thinking as Record<string, unknown>;
+    if (typeof thinking.enabled !== 'boolean') {
+      throw new Error('Recipe agent.thinking.enabled must be a boolean.');
+    }
+    if (thinking.budgetTokens !== undefined && (typeof thinking.budgetTokens !== 'number' || thinking.budgetTokens <= 0)) {
+      throw new Error('Recipe agent.thinking.budgetTokens must be a positive number.');
+    }
+    if (thinking.type !== undefined && thinking.type !== 'enabled' && thinking.type !== 'adaptive') {
+      throw new Error('Recipe agent.thinking.type must be "enabled" or "adaptive".');
+    }
+    if (thinking.display !== undefined && thinking.display !== 'summarized' && thinking.display !== 'omitted') {
+      throw new Error('Recipe agent.thinking.display must be "summarized" or "omitted".');
+    }
+    if (thinking.enabled === true && typeof thinking.budgetTokens === 'number' && typeof agent.maxTokens === 'number') {
+      if (thinking.budgetTokens >= agent.maxTokens) {
+        throw new Error(
+          `Recipe agent.thinking.budgetTokens (${thinking.budgetTokens}) must be less than agent.maxTokens (${agent.maxTokens}) ` +
+            `(Anthropic requires max_tokens > thinking.budget_tokens).`,
+        );
+      }
+    }
+  }
+
+  // Validate the extensions block if present (before the strategy check,
+  // which consults it to admit custom strategy types).
+  let hasStrategyExtension = false;
+  if (obj.extensions !== undefined) {
+    if (!obj.extensions || typeof obj.extensions !== 'object' || Array.isArray(obj.extensions)) {
+      throw new Error('Recipe "extensions" must be an object mapping names to extension entries.');
+    }
+    for (const [name, entry] of Object.entries(obj.extensions as Record<string, unknown>)) {
+      if (!name) throw new Error('Recipe extensions keys must be non-empty names.');
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`extensions.${name} must be an object.`);
+      }
+      const ext = entry as Record<string, unknown>;
+      if (ext.kind !== 'strategy' && ext.kind !== 'module') {
+        throw new Error(`extensions.${name}.kind must be "strategy" or "module", got ${JSON.stringify(ext.kind)}.`);
+      }
+      if (typeof ext.path !== 'string' || !ext.path) {
+        throw new Error(`extensions.${name}.path must be a non-empty string.`);
+      }
+      if (ext.config !== undefined && (!ext.config || typeof ext.config !== 'object' || Array.isArray(ext.config))) {
+        throw new Error(`extensions.${name}.config must be an object.`);
+      }
+      for (const metaKey of ['source', 'sourceMeta'] as const) {
+        if (ext[metaKey] !== undefined && (!ext[metaKey] || typeof ext[metaKey] !== 'object' || Array.isArray(ext[metaKey]))) {
+          throw new Error(`extensions.${name}.${metaKey} must be an object.`);
+        }
+      }
+      if (ext.kind === 'strategy') hasStrategyExtension = true;
+    }
+  }
+
+  // Validate strategy type if present
+  if (agent.strategy) {
+    const strategy = agent.strategy as Record<string, unknown>;
+    if (
+      strategy.type &&
+      strategy.type !== 'autobiographical' &&
+      strategy.type !== 'passthrough' &&
+      strategy.type !== 'frontdesk' &&
+      !hasStrategyExtension
+    ) {
+      throw new Error(
+        `Invalid strategy type "${strategy.type}". Must be "autobiographical", "passthrough", ` +
+        `or "frontdesk" — or a custom type registered by a "kind": "strategy" entry in the ` +
+        `recipe's "extensions" block (none is declared).`,
+      );
+    }
+    if (
+      strategy.compressionRefusalCurveFallbacks !== undefined
+      && (
+        typeof strategy.compressionRefusalCurveFallbacks !== 'number'
+        || !Number.isSafeInteger(strategy.compressionRefusalCurveFallbacks)
+        || strategy.compressionRefusalCurveFallbacks < 0
+      )
+    ) {
+      throw new Error('Recipe agent.strategy.compressionRefusalCurveFallbacks must be a non-negative safe integer.');
+    }
+    if (
+      strategy.compressionContextBudgetTokens !== undefined
+      && (
+        typeof strategy.compressionContextBudgetTokens !== 'number'
+        || !Number.isSafeInteger(strategy.compressionContextBudgetTokens)
+        || strategy.compressionContextBudgetTokens <= 0
+      )
+    ) {
+      throw new Error('Recipe agent.strategy.compressionContextBudgetTokens must be a positive safe integer.');
+    }
+  }
+
+  const refusalHandling = agent.refusalHandling as Record<string, unknown> | undefined;
+  if (refusalHandling && Object.hasOwn(refusalHandling, 'primarySummaryFallback')) {
+    throw new Error('Recipe agent.refusalHandling.primarySummaryFallback was removed and is unsupported.');
+  }
+
+  // Validate mcpServers entries if present
+  if (obj.mcpServers && typeof obj.mcpServers === 'object') {
+    for (const [id, entry] of Object.entries(obj.mcpServers as Record<string, unknown>)) {
+      if (!entry || typeof entry !== 'object') {
+        throw new Error(`mcpServers.${id} must be an object`);
+      }
+      const server = entry as Record<string, unknown>;
+      const hasCommand = typeof server.command === 'string' && server.command;
+      const hasUrl = typeof server.url === 'string' && server.url;
+      if (!hasCommand && !hasUrl) {
+        throw new Error(`mcpServers.${id} must have a "command" string (stdio) or "url" string (websocket)`);
+      }
+      if (server.args !== undefined && !Array.isArray(server.args)) {
+        throw new Error(`mcpServers.${id}.args must be an array`);
+      }
+      if (server.source !== undefined) {
+        if (typeof server.source !== 'object' || server.source === null) {
+          throw new Error(`mcpServers.${id}.source must be an object`);
+        }
+        const src = server.source as Record<string, unknown>;
+        if (typeof src.url !== 'string' || !src.url) {
+          throw new Error(`mcpServers.${id}.source.url must be a non-empty string`);
+        }
+        if (src.ref !== undefined && typeof src.ref !== 'string') {
+          throw new Error(`mcpServers.${id}.source.ref must be a string`);
+        }
+        if (src.install !== undefined) {
+          const install = src.install;
+          const isShorthand = install === 'npm' || install === 'pip-editable';
+          const isCustom =
+            typeof install === 'object' && install !== null
+            && typeof (install as Record<string, unknown>).run === 'string'
+            && ['node', 'python3', 'custom', 'bun'].includes(
+              (install as Record<string, unknown>).runtime as string,
+            );
+          if (!isShorthand && !isCustom) {
+            throw new Error(
+              `mcpServers.${id}.source.install must be 'npm', 'pip-editable', ` +
+              `or { run: string, runtime: 'node' | 'python3' | 'custom' | 'bun' }`,
+            );
+          }
+        }
+        if (src.authSecret !== undefined && typeof src.authSecret !== 'string') {
+          throw new Error(`mcpServers.${id}.source.authSecret must be a string`);
+        }
+        if (src.sslBypass !== undefined && typeof src.sslBypass !== 'boolean') {
+          throw new Error(`mcpServers.${id}.source.sslBypass must be a boolean`);
+        }
+        if (src.systemPackages !== undefined) {
+          // The regex bounds these to Debian package names — build tooling
+          // pastes them into an `apt-get install` line, so an unbounded string
+          // is a command-injection vector. Kept in sync with cook's vendored
+          // copy (connectome-cook src/vendor/recipe.ts).
+          if (!Array.isArray(src.systemPackages)
+            || !(src.systemPackages as unknown[]).every(
+              (p) => typeof p === 'string' && /^[a-z0-9][a-z0-9+.\-]+$/.test(p),
+            )) {
+            throw new Error(`mcpServers.${id}.source.systemPackages must be an array of Debian package names`);
+          }
+        }
+        if (src.inContainer !== undefined) {
+          if (typeof src.inContainer !== 'object' || src.inContainer === null) {
+            throw new Error(`mcpServers.${id}.source.inContainer must be an object`);
+          }
+          if (typeof (src.inContainer as Record<string, unknown>).path !== 'string') {
+            throw new Error(`mcpServers.${id}.source.inContainer.path must be a string`);
+          }
+        }
+      }
+      for (const field of ['enabledTools', 'disabledTools'] as const) {
+        if (server[field] === undefined) continue;
+        if (!Array.isArray(server[field]) || !(server[field] as unknown[]).every((p) => typeof p === 'string' && p)) {
+          throw new Error(`mcpServers.${id}.${field} must be an array of non-empty strings`);
+        }
+      }
+      if (server.credentialFiles !== undefined) {
+        if (!Array.isArray(server.credentialFiles)) {
+          throw new Error(`mcpServers.${id}.credentialFiles must be an array`);
+        }
+        const seenPaths = new Set<string>();
+        for (let i = 0; i < server.credentialFiles.length; i++) {
+          const cf = server.credentialFiles[i] as Record<string, unknown>;
+          if (!cf || typeof cf !== 'object') {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}] must be an object`);
+          }
+          if (typeof cf.path !== 'string' || !cf.path) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].path must be a non-empty string`);
+          }
+          if (seenPaths.has(cf.path)) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].path "${cf.path}" is duplicated within the same server`);
+          }
+          seenPaths.add(cf.path);
+          if (cf.format !== 'ini' && cf.format !== 'json' && cf.format !== 'env') {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].format must be 'ini', 'json', or 'env'`);
+          }
+          if (cf.section !== undefined && typeof cf.section !== 'string') {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].section must be a string`);
+          }
+          if (cf.mode !== undefined && (typeof cf.mode !== 'string' || !/^0?[0-7]{3,4}$/.test(cf.mode))) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].mode must be an octal string like "0600"`);
+          }
+          if (!Array.isArray(cf.fields) || cf.fields.length === 0) {
+            throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields must be a non-empty array`);
+          }
+          const seenFieldNames = new Set<string>();
+          for (let j = 0; j < cf.fields.length; j++) {
+            const f = cf.fields[j] as Record<string, unknown>;
+            if (!f || typeof f !== 'object') {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}] must be an object`);
+            }
+            if (typeof f.name !== 'string' || !f.name) {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].name must be a non-empty string`);
+            }
+            if (seenFieldNames.has(f.name)) {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].name "${f.name}" is duplicated`);
+            }
+            seenFieldNames.add(f.name);
+            if (f.envOverride !== undefined && (typeof f.envOverride !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(f.envOverride))) {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].envOverride must be a valid env var name`);
+            }
+            for (const optStr of ['description', 'placeholder'] as const) {
+              if (f[optStr] !== undefined && typeof f[optStr] !== 'string') {
+                throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].${optStr} must be a string`);
+              }
+            }
+            if (f.secret !== undefined && typeof f.secret !== 'boolean') {
+              throw new Error(`mcpServers.${id}.credentialFiles[${i}].fields[${j}].secret must be a boolean`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Validate workspace mounts if present
+  if (obj.modules && typeof obj.modules === 'object') {
+    const mods = obj.modules as Record<string, unknown>;
+    if (mods.workspace && typeof mods.workspace === 'object') {
+      const ws = mods.workspace as Record<string, unknown>;
+      if (!Array.isArray(ws.mounts) || ws.mounts.length === 0) {
+        throw new Error('workspace.mounts must be a non-empty array');
+      }
+      for (let i = 0; i < ws.mounts.length; i++) {
+        const m = ws.mounts[i] as Record<string, unknown>;
+        if (!m || typeof m !== 'object') {
+          throw new Error(`workspace.mounts[${i}] must be an object`);
+        }
+        if (typeof m.name !== 'string' || !m.name) {
+          throw new Error(`workspace.mounts[${i}].name must be a non-empty string`);
+        }
+        if (typeof m.path !== 'string' || !m.path) {
+          throw new Error(`workspace.mounts[${i}].path must be a non-empty string`);
+        }
+        if (m.mode !== undefined && m.mode !== 'read-write' && m.mode !== 'read-only') {
+          throw new Error(`workspace.mounts[${i}].mode must be "read-write" or "read-only"`);
+        }
+      }
+    }
+
+    // Validate retrieval provider reasoning when configured.
+    const retrieval = mods.retrieval;
+    if (retrieval !== undefined && typeof retrieval !== 'boolean') {
+      if (!retrieval || typeof retrieval !== 'object' || Array.isArray(retrieval)) {
+        throw new Error('Recipe modules.retrieval must be a boolean or object.');
+      }
+      const retrievalConfig = retrieval as Record<string, unknown>;
+      if (retrievalConfig.reasoningContext !== undefined) {
+        throw new Error(
+          'modules.retrieval.reasoningContext is not supported: retrieval model calls ' +
+          'are independent one-shot requests with no earlier reasoning items.',
+        );
+      }
+      const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+      if (retrievalConfig.reasoningEffort !== undefined &&
+          (typeof retrievalConfig.reasoningEffort !== 'string'
+            || !efforts.includes(retrievalConfig.reasoningEffort))) {
+        throw new Error(`Invalid modules.retrieval.reasoningEffort ${JSON.stringify(retrievalConfig.reasoningEffort)}.`);
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && agent.provider !== 'openai-responses'
+          && agent.provider !== 'openai-codex') {
+        throw new Error(
+          'modules.retrieval.reasoningEffort requires agent.provider ' +
+          '"openai-responses" or "openai-codex".',
+        );
+      }
+      if (retrievalConfig.reasoningEffort !== undefined
+          && (typeof retrievalConfig.model !== 'string'
+            || !retrievalConfig.model.trim())) {
+        throw new Error(
+          'modules.retrieval.model must be a non-empty string when ' +
+          'modules.retrieval.reasoningEffort is configured.',
+        );
+      }
+    }
+
+    // Validate ttsRelay if present — url + token are load-bearing, and a
+    // recipe that names the module but can't reach a relay should fail at
+    // load, not silently stream nowhere.
+    if (mods.ttsRelay !== undefined && mods.ttsRelay !== false) {
+      if (typeof mods.ttsRelay !== 'object' || mods.ttsRelay === null) {
+        throw new Error('modules.ttsRelay must be an object ({ url, token, ... })');
+      }
+      const tr = mods.ttsRelay as Record<string, unknown>;
+      if (typeof tr.url !== 'string' || !/^wss?:\/\//.test(tr.url)) {
+        throw new Error('modules.ttsRelay.url must be a ws:// or wss:// URL');
+      }
+      if (typeof tr.token !== 'string' || !tr.token) {
+        throw new Error('modules.ttsRelay.token must be a non-empty string (use ${VAR} substitution)');
+      }
+    }
+
+    // Validate fleet if present (object form only — boolean is trivially valid).
+    if (mods.fleet && typeof mods.fleet === 'object') {
+      const fleet = mods.fleet as Record<string, unknown>;
+      if (fleet.children !== undefined) {
+        if (!Array.isArray(fleet.children)) {
+          throw new Error('fleet.children must be an array');
+        }
+        const seenNames = new Set<string>();
+        for (let i = 0; i < fleet.children.length; i++) {
+          const c = fleet.children[i] as Record<string, unknown>;
+          if (!c || typeof c !== 'object') {
+            throw new Error(`fleet.children[${i}] must be an object`);
+          }
+          if (typeof c.name !== 'string' || !c.name) {
+            throw new Error(`fleet.children[${i}].name must be a non-empty string`);
+          }
+          if (seenNames.has(c.name)) {
+            throw new Error(`fleet.children[${i}].name "${c.name}" is duplicated`);
+          }
+          seenNames.add(c.name);
+          if (typeof c.recipe !== 'string' || !c.recipe) {
+            throw new Error(`fleet.children[${i}].recipe must be a non-empty string`);
+          }
+          if (c.subscription !== undefined && !Array.isArray(c.subscription)) {
+            throw new Error(`fleet.children[${i}].subscription must be an array of strings`);
+          }
+          if (c.autoStart !== undefined && typeof c.autoStart !== 'boolean') {
+            throw new Error(`fleet.children[${i}].autoStart must be a boolean`);
+          }
+        }
+      }
+      if (fleet.allowedRecipes !== undefined) {
+        if (!Array.isArray(fleet.allowedRecipes) || !fleet.allowedRecipes.every((r) => typeof r === 'string')) {
+          throw new Error('fleet.allowedRecipes must be an array of strings');
+        }
+        // Prefix-match-only: reject mid-string `*` so the pattern can't look
+        // like a glob while silently behaving as a literal.
+        for (const pattern of fleet.allowedRecipes as string[]) {
+          if (pattern === '*' || !pattern.includes('*')) continue;
+          if (pattern.indexOf('*') !== pattern.length - 1) {
+            throw new Error(
+              `fleet.allowedRecipes entry "${pattern}" has a mid-string "*". ` +
+              `Only trailing "*" (prefix match) or a bare "*" (allow all) are supported.`,
+            );
+          }
+        }
+      }
+      if (fleet.defaultSubscription !== undefined) {
+        if (!Array.isArray(fleet.defaultSubscription) || !fleet.defaultSubscription.every((s) => typeof s === 'string')) {
+          throw new Error('fleet.defaultSubscription must be an array of strings');
+        }
+      }
+      for (const k of ['socketWaitTimeoutMs', 'readyTimeoutMs', 'gracefulShutdownMs', 'sigtermEscalationMs'] as const) {
+        if (fleet[k] !== undefined && (typeof fleet[k] !== 'number' || (fleet[k] as number) < 0)) {
+          throw new Error(`fleet.${k} must be a non-negative number`);
+        }
+      }
+    }
+  }
+
+  if (obj.codeExecution !== undefined) {
+    if (!obj.codeExecution || typeof obj.codeExecution !== 'object' || Array.isArray(obj.codeExecution)) {
+      throw new Error('Recipe codeExecution must be an object.');
+    }
+    const ce = obj.codeExecution as Record<string, unknown>;
+    if (typeof ce.enabled !== 'boolean') {
+      throw new Error('Recipe codeExecution.enabled must be a boolean.');
+    }
+    if (ce.pythonPath !== undefined && (typeof ce.pythonPath !== 'string' || !ce.pythonPath.trim())) {
+      throw new Error('Recipe codeExecution.pythonPath must be a non-empty string.');
+    }
+    for (const k of ['toolCallTimeoutMs', 'scriptTimeoutMs', 'idleReclaimMs'] as const) {
+      if (ce[k] !== undefined && (typeof ce[k] !== 'number' || (ce[k] as number) < 0)) {
+        throw new Error(`Recipe codeExecution.${k} must be a non-negative number.`);
+      }
+    }
+  }
+
+  return obj as unknown as Recipe;
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+function savedRecipePath(dataDir: string): string {
+  return resolve(dataDir, '.recipe.json');
+}
+
+export function saveRecipe(dataDir: string, recipe: Recipe): void {
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(savedRecipePath(dataDir), JSON.stringify(recipe, null, 2) + '\n', 'utf-8');
+}
+
+export function loadSavedRecipe(dataDir: string): Recipe | null {
+  const path = savedRecipePath(dataDir);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf-8'));
+    return validateRecipe(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function clearSavedRecipe(dataDir: string): void {
+  const path = savedRecipePath(dataDir);
+  if (existsSync(path)) {
+    unlinkSync(path);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CLI helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse argv to find a recipe source. Returns null if none provided.
+ * Skips known flags (--no-tui, --no-recipe).
+ */
+export function parseRecipeArg(argv: string[]): { source: string | null; noRecipe: boolean } {
+  const noRecipe = argv.includes('--no-recipe');
+  let source: string | null = null;
+
+  for (const arg of argv.slice(2)) {
+    if (arg.startsWith('--')) continue;
+    // First positional arg is the recipe source
+    source = arg;
+    break;
+  }
+
+  return { source, noRecipe };
+}

@@ -14,9 +14,9 @@
     "postinstall": "test -d web && npm --prefix web install && npm --prefix web run build || true"
   },
   "dependencies": {
-    "@animalabs/agent-framework": "^0.7.2",
+    "@animalabs/agent-framework": "file:/Users/jai/agents/separatrix-fable/forks/agent-framework",
     "@animalabs/chronicle": "^0.2.0",
-    "@animalabs/context-manager": "^0.6.3",
+    "@animalabs/context-manager": "file:/Users/jai/agents/separatrix-fable/forks/context-manager",
     "@animalabs/membrane": "^0.5.77",
     "@opentui/core": "^0.1.82"
   },

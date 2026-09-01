@@ -134,6 +134,28 @@ export interface RecipeAgent {
    *  cache and rejects the ttl field. */
   cacheTtl?: '5m' | '1h';
   /**
+   * Prompt-cache keepalive. With `cacheTtl: '1h'`, an idle agent's cached
+   * prefix expires after an hour and its next wake pays a 2x cache write over
+   * the whole context. Reading an entry refreshes its TTL at 0.1x, so a
+   * periodic `max_tokens: 0` replay holds it warm for pennies.
+   *
+   * On by default for the anthropic provider (ignored elsewhere — bedrock has
+   * no 1h cache). Measured on fable-cm 2026-08-11..22: 49.7M tokens of cache
+   * writes followed a >1h idle gap, ~$944 of write premium at fable-5 rates
+   * that this converts to ~$308 of reads.
+   *
+   * Cost is proportional to actual idleness, not to `maxIdleHours` — a busy
+   * agent never fires one, because its own traffic already refreshes the TTL.
+   */
+  cacheKeepalive?: {
+    /** Default true (anthropic provider only). */
+    enabled?: boolean;
+    /** Stop refreshing this long after the last REAL request. Default 24. */
+    maxIdleHours?: number;
+    /** Refresh once untouched this long. Must be < 60 with a 1h TTL. Default 45. */
+    refreshAfterMinutes?: number;
+  };
+  /**
    * Explicit prompt-caching override. Unset means provider-appropriate
    * default: on for everything except bedrock models that predate caching
    * support there (see bedrockModelSupportsPromptCaching). Set false if a
@@ -1006,6 +1028,37 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.cacheTtl must be '5m' or '1h', got ${JSON.stringify(agent.cacheTtl)}.`);
   }
   agent.cacheTtl ??= '1h';
+
+  // A keepalive that fires AFTER the entry has already expired is the worst of
+  // both worlds: it pays a full 2x cache write on every poke, forever, and
+  // reports success while doing it. Refuse the config rather than discover it
+  // in a bill. (The runtime also self-checks — see membrane cache-keepalive —
+  // but a typo'd recipe should never get that far.)
+  const keepalive = agent.cacheKeepalive;
+  if (keepalive !== undefined) {
+    if (typeof keepalive !== 'object' || keepalive === null) {
+      throw new Error(`Recipe agent.cacheKeepalive must be an object, got ${JSON.stringify(keepalive)}.`);
+    }
+    const { maxIdleHours, refreshAfterMinutes } = keepalive as {
+      maxIdleHours?: unknown;
+      refreshAfterMinutes?: unknown;
+    };
+    if (refreshAfterMinutes !== undefined) {
+      if (typeof refreshAfterMinutes !== 'number' || !(refreshAfterMinutes > 0)) {
+        throw new Error(`Recipe agent.cacheKeepalive.refreshAfterMinutes must be a positive number, got ${JSON.stringify(refreshAfterMinutes)}.`);
+      }
+      const ttlMinutes = agent.cacheTtl === '1h' ? 60 : 5;
+      if (refreshAfterMinutes >= ttlMinutes) {
+        throw new Error(
+          `Recipe agent.cacheKeepalive.refreshAfterMinutes (${refreshAfterMinutes}) must be less than the ${agent.cacheTtl} cache TTL (${ttlMinutes}m), ` +
+          'or every keepalive would land after the entry expired and pay a full cache write instead of a read.',
+        );
+      }
+    }
+    if (maxIdleHours !== undefined && (typeof maxIdleHours !== 'number' || !(maxIdleHours > 0))) {
+      throw new Error(`Recipe agent.cacheKeepalive.maxIdleHours must be a positive number, got ${JSON.stringify(maxIdleHours)}.`);
+    }
+  }
 
   if (agent.promptCaching !== undefined && typeof agent.promptCaching !== 'boolean') {
     throw new Error(
