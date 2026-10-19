@@ -14,6 +14,13 @@
  * the outgoing Anthropic request when enabled — keeping the cross-cutting
  * "request mutator" plumbing out of every call site.
  *
+ * Two writers: the agent (agent_settings update/reset, via the extension
+ * below) and an operator (`operatorSetReasoning`, reached only through the
+ * headless IPC `reasoning-set` verb, src/operator-reasoning.ts). Every write
+ * from either, and the state loaded at start, is recorded in the host-side
+ * settings ledger (src/settings-ledger.ts); nothing here ever writes to the
+ * agent's context.
+ *
  * Designed to be extensible: new domains add their own slice in
  * `SettingsState` + a few tools + a typed accessor. Bundled with the host;
  * recipes opt in by including `SettingsModule` in moduleInstances.
