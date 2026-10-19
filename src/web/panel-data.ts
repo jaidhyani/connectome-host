@@ -21,6 +21,7 @@
 import type { AgentFramework } from '@animalabs/agent-framework';
 import type { Recipe } from '../recipe.js';
 import type { CallLedger } from '../call-ledger.js';
+import { withSettingsSource } from '../settings-ledger.js';
 import {
   readMcplServersFile,
   DEFAULT_CONFIG_PATH,
@@ -314,7 +315,10 @@ export function applySettingsUpdate(
   if (typeof fw.updateAgentRuntimeSettings !== 'function') {
     throw new PanelError('runtime settings unavailable on this build', 501);
   }
-  fw.updateAgentRuntimeSettings(agentName, patch, { persist: params.persist !== false });
+  // Operator path: recorded in the settings ledger as 'operator_panel' (the
+  // web UI and the IPC panel-request verb both come through here).
+  withSettingsSource('operator_panel', () =>
+    fw.updateAgentRuntimeSettings(agentName, patch, { persist: params.persist !== false }));
 }
 
 export function applySettingsReset(
@@ -329,7 +333,8 @@ export function applySettingsReset(
     throw new PanelError('runtime settings unavailable on this build', 501);
   }
   const keys = Array.isArray(params.keys) ? (params.keys as string[]) : undefined;
-  fw.resetAgentRuntimeSettings(agentName, keys, { persist: params.persist !== false });
+  withSettingsSource('operator_panel', () =>
+    fw.resetAgentRuntimeSettings(agentName, keys, { persist: params.persist !== false }));
 }
 
 export function applySettingsCancelTransition(app: PanelAppRef, agentName: string): void {
@@ -339,7 +344,7 @@ export function applySettingsCancelTransition(app: PanelAppRef, agentName: strin
   if (typeof fw.cancelAgentRuntimeSettingsTransition !== 'function') {
     throw new PanelError('runtime settings unavailable on this build', 501);
   }
-  fw.cancelAgentRuntimeSettingsTransition(agentName);
+  withSettingsSource('operator_panel', () => fw.cancelAgentRuntimeSettingsTransition(agentName));
 }
 
 /**

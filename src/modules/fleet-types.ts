@@ -49,7 +49,14 @@ export type IncomingCommand =
    * shared handler (`runPanelOp`), so a new panel surface needs no protocol
    * change to work across the fleet.
    */
-  | { type: 'panel-request'; op: string; params?: Record<string, unknown>; corrId?: string };
+  | { type: 'panel-request'; op: string; params?: Record<string, unknown>; corrId?: string }
+  /** Read the reasoning levers and whether every agent is idle. Response is
+   *  `reasoning-get-result`. See src/operator-reasoning.ts. */
+  | { type: 'reasoning-get'; corrId?: string }
+  /** Operator flip of the reasoning levers, refused unless every agent is
+   *  idle; never notifies the agent; recorded in the settings ledger.
+   *  Response is `reasoning-set-result`. See src/operator-reasoning.ts. */
+  | { type: 'reasoning-set'; enabled?: boolean; display?: 'summarized' | 'omitted'; corrId?: string };
 
 // ---------------------------------------------------------------------------
 // Child → Parent: events

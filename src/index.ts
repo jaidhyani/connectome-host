@@ -68,6 +68,7 @@ import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-
 import { buildFrameworkStrategy } from './framework-strategy.js';
 import { logKeepaliveEvent } from './cache-keepalive-log.js';
 import { loadExtensions } from './extensions.js';
+import { SettingsLedger, instrumentFrameworkSettings, CORE_SETTINGS_KEYS } from './settings-ledger.js';
 
 export type { AppContext };
 
@@ -165,6 +166,7 @@ async function createFramework(
   agentName: string,
   settingsModule: SettingsModule,
   callLedger: CallLedger | null,
+  settingsLedger: SettingsLedger,
 ): Promise<AgentFramework> {
   const model = resolveModel(recipe);
   const modules = recipe.modules ?? {};
@@ -582,6 +584,16 @@ agents: [agentConfig],
     (framework as unknown as Record<symbol, WebUiModule>)[webUiModuleSymbol] = webUiModule;
   }
 
+  // Every change to the framework's core runtime settings (context budget,
+  // tail, pace, think-text policy), from the agent's tool or an operator
+  // panel, lands in the host-side settings ledger; so does what was loaded.
+  // Reasoning keys are recorded by SettingsModule itself.
+  instrumentFrameworkSettings(framework, settingsLedger);
+  try {
+    settingsLedger.record('startup', 'load', CORE_SETTINGS_KEYS, null,
+      framework.getAgentRuntimeSettings(agentName) as unknown as Record<string, unknown>, agentName);
+  } catch { /* framework build without runtime settings: nothing to record */ }
+
   return framework;
 }
 
@@ -853,7 +865,14 @@ async function main() {
   // SettingsModule constructed early so the adapter can read its state for
   // cross-cutting concerns (currently: reasoning). It's wired into the
   // framework's module list inside createFramework().
-  const settingsModule = new SettingsModule();
+  // Host-side settings-change ledger (src/settings-ledger.ts): every change to
+  // any agent setting, from any source, one JSONL line per key. Lives beside
+  // llm-calls in DATA_DIR, outside every workspace mount; never enters the
+  // agent's context. SETTINGS_LEDGER_PATH overrides the location.
+  const settingsLedger = new SettingsLedger(
+    process.env.SETTINGS_LEDGER_PATH || join(config.dataDir, 'settings-changes.jsonl'),
+  );
+  const settingsModule = new SettingsModule({ ledger: settingsLedger });
 
   // Append each LLM request/response/error to a JSONL log per process lifetime
   // (matches the Hermes-era `llm-calls.<iso>.jsonl` visibility). The adapter
@@ -1009,7 +1028,7 @@ async function main() {
   });
 
   const storePath = sessionManager.getStorePath(activeSession.id);
-  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger);
+  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, settingsLedger);
 
   // Build app context
   const app: AppContext = {
@@ -1032,7 +1051,7 @@ async function main() {
       // re-resolution would matter only if recipe.agent.name is absent
       // AND the user switches between imports that used different
       // --agent values; not the canonical flow.
-      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger);
+      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, settingsLedger);
       this.framework.start();
       this.userMessageCount = 0;
       resetBranchState(this.branchState);

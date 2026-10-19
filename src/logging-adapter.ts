@@ -144,7 +144,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     }
   }
 
-  private requestSummary(request: ProviderRequest, rawRequest?: unknown): Record<string, unknown> {
+  /**
+   * `effective` is the request handed to membrane (after withReasoning), used
+   * only when the raw API payload wasn't captured (a failure before membrane
+   * built it).
+   */
+  private requestSummary(
+    request: ProviderRequest,
+    rawRequest?: unknown,
+    effective?: ProviderRequest,
+  ): Record<string, unknown> {
     const cache = rawRequest ? summarizeCacheControls(rawRequest) : undefined;
     return {
       model: request.model,
@@ -152,6 +161,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       messages: request.messages.length,
       tools: request.tools?.length ?? 0,
       ...(cache ? { cacheBreakpoints: cache.count, cacheTtls: cache.ttls } : {}),
+      ...thinkingReceipt(rawRequest, effective),
     };
   }
 
@@ -266,7 +276,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.log({
         type: 'call', kind: 'complete',
         timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
+        requestSummary: this.requestSummary(request, sink.rawRequest, effective),
         rawRequest: this.refusalRawRequest(response, sink.rawRequest),
         rawResponse: (response as { raw?: unknown }).raw ?? null,
       });
@@ -278,7 +288,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.log({
         type: 'error', kind: 'complete',
         timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
+        requestSummary: this.requestSummary(request, sink.rawRequest, effective),
         rawRequest: sink.rawRequest,
         error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
       });
@@ -303,7 +313,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.log({
         type: 'call', kind: 'stream',
         timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
+        requestSummary: this.requestSummary(request, sink.rawRequest, effective),
         rawRequest: this.refusalRawRequest(response, sink.rawRequest),
         rawResponse: (response as { raw?: unknown }).raw ?? null,
       });
@@ -315,7 +325,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.log({
         type: 'error', kind: 'stream',
         timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
+        requestSummary: this.requestSummary(request, sink.rawRequest, effective),
         rawRequest: sink.rawRequest,
         error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
       });
@@ -323,4 +333,38 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       throw err;
     }
   }
+}
+
+/**
+ * Per-call receipt of the `thinking` parameter actually sent, for the request
+ * summary: `thinking: null` when no parameter was sent, else its `type` and
+ * `display` (and `budget_tokens` if present). Read from the raw API payload
+ * membrane built (`thinkingFrom: 'raw'`), so it shows what went on the wire
+ * rather than what the settings said; falls back to the effective request
+ * (`thinkingFrom: 'effective'`) only when no payload was captured. Metadata
+ * only: never thinking text, which lives in the response anyway.
+ */
+export function thinkingReceipt(
+  rawRequest: unknown,
+  effective?: ProviderRequest,
+): { thinking: Record<string, unknown> | null; thinkingFrom: 'raw' | 'effective' } | Record<string, never> {
+  const pick = (t: unknown): Record<string, unknown> | null => {
+    if (!t || typeof t !== 'object') return null;
+    const o = t as Record<string, unknown>;
+    return {
+      type: o.type ?? null,
+      display: o.display ?? null,
+      ...(o.budget_tokens !== undefined ? { budget_tokens: o.budget_tokens } : {}),
+    };
+  };
+  if (rawRequest && typeof rawRequest === 'object') {
+    return { thinking: pick((rawRequest as Record<string, unknown>).thinking), thinkingFrom: 'raw' };
+  }
+  if (effective) {
+    return {
+      thinking: pick((effective.extra as Record<string, unknown> | undefined)?.thinking),
+      thinkingFrom: 'effective',
+    };
+  }
+  return {};
 }

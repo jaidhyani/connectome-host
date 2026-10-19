@@ -138,6 +138,8 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     'workspace-file-snapshot',
     'cancel-subagent-result',
     'panel-response',
+    'reasoning-get-result',
+    'reasoning-set-result',
   ]);
 
   function emit(event: Record<string, unknown>): void {
@@ -341,6 +343,18 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
         const { runPanelOp } = await import('./web/panel-data.js');
         const result = await runPanelOp(app, op, cmd.params ?? {});
         emit({ type: 'panel-response', corrId: cmd.corrId, op, ...result });
+        return;
+      }
+      case 'reasoning-get': {
+        const { operatorGetReasoning } = await import('./operator-reasoning.js');
+        emit({ type: 'reasoning-get-result', corrId: cmd.corrId, ...operatorGetReasoning(app) });
+        return;
+      }
+      case 'reasoning-set': {
+        const { operatorSetReasoning } = await import('./operator-reasoning.js');
+        const result = operatorSetReasoning(app, cmd as unknown as Record<string, unknown>);
+        log(`reasoning-set: ${result.ok ? 'applied' : `refused (${result.error})`}`);
+        emit({ type: 'reasoning-set-result', corrId: cmd.corrId, ...result });
         return;
       }
       case 'cancel-subagent': {
