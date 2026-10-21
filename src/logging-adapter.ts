@@ -101,7 +101,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   }
 
   /** If reasoning is enabled, inject `thinking` into the request before the
-   *  adapter builds the Anthropic payload. The Anthropic adapter forwards
+   *  adapter builds the Anthropic payload. Applied on stream() only (agent
+   *  turns); see complete() for why. The Anthropic adapter forwards
    *  provider-specific params carried in `request.extra`, so that's the hook
    *  point. We return a shallow clone to avoid surprising callers. */
   private withReasoning(request: ProviderRequest): ProviderRequest {
@@ -266,7 +267,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const t0 = Date.now();
-    const effective = this.withOAuthIdentity(this.withReasoning(request));
+    // No withReasoning here: the reasoning setting scopes to agent-role calls,
+    // which are the streamed ones (Agent.doInference / streamYielding →
+    // stream()). complete() carries everything else: autobiographical
+    // compression and merges, transition summaries, session naming, MCPL
+    // non-streamed inference. Those never get a thinking parameter from the
+    // setting, so flipping the agent's reasoning can't change the conditions
+    // its memory is written under (Aesop's memory-adjacent exclusion,
+    // 2026-10-19). An agent configured with `streaming: false` would route its
+    // turns here and lose the lever; the per-call receipt shows that at once.
+    const effective = this.withOAuthIdentity(request);
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
     try {

@@ -10,9 +10,10 @@
  * was tool bloat for one boolean + number).
  *
  * The host's adapter wrapper (LoggingAnthropicAdapter) reads `getReasoning()`
- * on each call and injects `thinking: {type:'enabled', budget_tokens: N}` into
- * the outgoing Anthropic request when enabled — keeping the cross-cutting
- * "request mutator" plumbing out of every call site.
+ * on each streamed call (the agent's own turns) and injects adaptive
+ * `thinking: {type:'adaptive', display}` when enabled — keeping the
+ * cross-cutting "request mutator" plumbing out of every call site. Non-streamed
+ * calls (compression, summaries, naming) never get the parameter.
  *
  * Two writers: the agent (agent_settings update/reset, via the extension
  * below) and an operator (`operatorSetReasoning`, reached only through the
@@ -208,7 +209,8 @@ export class SettingsModule implements Module {
         reasoning_enabled: {
           type: 'boolean',
           description:
-            'Extended thinking (reasoning) on subsequent inference calls.',
+            'Extended thinking (reasoning) on your own subsequent turns. Background calls ' +
+            '(memory compression, summaries) never use it.',
         },
         reasoning_budget_tokens: {
           type: 'number',

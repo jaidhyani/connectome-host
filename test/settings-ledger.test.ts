@@ -67,8 +67,9 @@ function fakeApp(mod: SettingsModule, statuses: Record<string, string>) {
 }
 
 /** A fake Anthropic client that records each wire request and answers with
- *  a minimal end_turn message, so `complete()` runs membrane's real
- *  buildRequest + onRequest path. */
+ *  a minimal end_turn message, so `complete()` and `stream()` both run
+ *  membrane's real buildRequest + onRequest path. `stream()` is the agent's
+ *  turn; `complete()` is compression and other background calls. */
 function wireAdapter(logPath: string, getReasoning: () => { enabled: boolean; budgetTokens: number; display?: 'summarized' | 'omitted' }) {
   const adapter = new LoggingAnthropicAdapter(
     { apiKey: 'test', cacheKeepalive: { enabled: false } } as never,
@@ -87,9 +88,23 @@ function wireAdapter(logPath: string, getReasoning: () => { enabled: boolean; bu
           usage: { input_tokens: 1, output_tokens: 1 },
         };
       },
+      stream: async (params: Record<string, unknown>) => {
+        sent.push(params);
+        const events = [
+          { type: 'message_start', message: { model: params.model, usage: { input_tokens: 1, output_tokens: 0 } } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } },
+          { type: 'message_stop' },
+        ];
+        return { async *[Symbol.asyncIterator]() { for (const e of events) yield e; } };
+      },
     },
   };
-  return { adapter, sent };
+  const agentTurn = () => adapter.stream(request, { onChunk: () => {} } as never);
+  const background = () => adapter.complete(request);
+  return { adapter, sent, agentTurn, background };
 }
 
 const request = {
@@ -113,24 +128,24 @@ describe('operator reasoning flip', () => {
     try {
       const { mod } = await startedModule();
       const logPath = join(dir, 'llm-calls.jsonl');
-      const { adapter, sent } = wireAdapter(logPath, () => mod.getReasoning());
+      const { sent, agentTurn } = wireAdapter(logPath, () => mod.getReasoning());
       const app = fakeApp(mod, { aesop: 'idle' });
 
-      await adapter.complete(request);
+      await agentTurn();
       expect(sent[0]!.thinking).toBeUndefined();
 
       const res = operatorSetReasoning(app, { type: 'reasoning-set', corrId: 'c1', enabled: true });
       expect(res.ok).toBe(true);
 
-      await adapter.complete(request);
+      await agentTurn();
       expect(sent[1]!.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
 
       expect(operatorSetReasoning(app, { display: 'omitted' }).ok).toBe(true);
-      await adapter.complete(request);
+      await agentTurn();
       expect(sent[2]!.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
 
       expect(operatorSetReasoning(app, { enabled: false }).ok).toBe(true);
-      await adapter.complete(request);
+      await agentTurn();
       expect(sent[3]!.thinking).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -457,9 +472,11 @@ describe('per-call thinking receipt in llm-calls', () => {
       const dir = mkdtempSync(join(tmpdir(), 'arm-receipt-'));
       try {
         const logPath = join(dir, 'llm-calls.jsonl');
-        const { adapter } = wireAdapter(logPath, () => ({ budgetTokens: 8192, ...r }));
-        await adapter.complete(request);
-        const summary = lastLogLine(logPath).requestSummary as Record<string, unknown>;
+        const { agentTurn } = wireAdapter(logPath, () => ({ budgetTokens: 8192, ...r }));
+        await agentTurn();
+        const line = lastLogLine(logPath);
+        expect(line.kind).toBe('stream');
+        const summary = line.requestSummary as Record<string, unknown>;
         expect(summary.thinking).toEqual(expected);
         expect(summary.thinkingFrom).toBe('raw');
       } finally {
@@ -472,9 +489,9 @@ describe('per-call thinking receipt in llm-calls', () => {
     const dir = mkdtempSync(join(tmpdir(), 'arm-receipt-'));
     try {
       const logPath = join(dir, 'llm-calls.jsonl');
-      const { adapter } = wireAdapter(logPath, () => ({ enabled: true, budgetTokens: 8192, display: 'omitted' }));
+      const { adapter, agentTurn } = wireAdapter(logPath, () => ({ enabled: true, budgetTokens: 8192, display: 'omitted' }));
       (adapter as unknown as { buildRequest: () => never }).buildRequest = () => { throw new Error('build failed'); };
-      await expect(adapter.complete(request)).rejects.toThrow();
+      await expect(agentTurn()).rejects.toThrow();
       const line = lastLogLine(logPath);
       expect(line.type).toBe('error');
       expect((line.requestSummary as Record<string, unknown>).thinking).toEqual({ type: 'adaptive', display: 'omitted' });
@@ -488,8 +505,8 @@ describe('per-call thinking receipt in llm-calls', () => {
     const dir = mkdtempSync(join(tmpdir(), 'arm-receipt-'));
     try {
       const logPath = join(dir, 'llm-calls.jsonl');
-      const { adapter } = wireAdapter(logPath, () => ({ enabled: true, budgetTokens: 8192 }));
-      await adapter.complete(request);
+      const { agentTurn } = wireAdapter(logPath, () => ({ enabled: true, budgetTokens: 8192 }));
+      await agentTurn();
       const summary = lastLogLine(logPath).requestSummary as Record<string, unknown>;
       expect(Object.keys(summary.thinking as object).sort()).toEqual(['display', 'type']);
     } finally {
@@ -548,5 +565,68 @@ describe("the agent's own agent_settings tool, through the real framework", () =
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scope: agent turns follow the setting, background calls never get it
+// ---------------------------------------------------------------------------
+
+describe('reasoning scope: agent-role calls only', () => {
+  for (const display of ['summarized', 'omitted'] as const) {
+    test(`a compression (complete) call carries no thinking parameter with reasoning ON, display ${display}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'arm-scope-'));
+      try {
+        const logPath = join(dir, 'llm-calls.jsonl');
+        const { sent, background } = wireAdapter(logPath, () => ({ enabled: true, budgetTokens: 8192, display }));
+        await background();
+        expect(sent[0]!.thinking).toBeUndefined();
+        const line = lastLogLine(logPath);
+        expect(line.kind).toBe('complete');
+        expect(line.requestSummary).toMatchObject({ thinking: null, thinkingFrom: 'raw' });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('interleaved: agent turns follow the live setting while compression stays pinned', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'arm-scope-'));
+    try {
+      const { mod } = await startedModule();
+      const app = fakeApp(mod, { aesop: 'idle' });
+      const logPath = join(dir, 'llm-calls.jsonl');
+      const { sent, agentTurn, background } = wireAdapter(logPath, () => mod.getReasoning());
+
+      await agentTurn();
+      await background();
+      operatorSetReasoning(app, { enabled: true });
+      await agentTurn();
+      await background();
+      operatorSetReasoning(app, { enabled: false });
+      await agentTurn();
+      await background();
+
+      expect(sent.map((p) => p.thinking ?? null)).toEqual([
+        null, null,
+        { type: 'adaptive', display: 'summarized' }, null,
+        null, null,
+      ]);
+      const receipts = readFileSync(logPath, 'utf-8').trim().split('\n')
+        .map((l) => JSON.parse(l) as { kind: string; requestSummary: { thinking: unknown } })
+        .map((l) => [l.kind, l.requestSummary.thinking]);
+      expect(receipts).toEqual([
+        ['stream', null], ['complete', null],
+        ['stream', { type: 'adaptive', display: 'summarized' }], ['complete', null],
+        ['stream', null], ['complete', null],
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the agent's tool description says background calls don't use it", () => {
+    const desc = (new SettingsModule().getAgentSettingsExtension().properties.reasoning_enabled as { description: string }).description;
+    expect(desc).toContain('memory compression');
   });
 });
